@@ -10,14 +10,14 @@ import (
 	"image/jpeg"
 	"image/png"
 	"math"
+	"net"
 	"net/http"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"sync"
 
 	"github.com/disintegration/imaging"
+	webview "github.com/webview/webview_go"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -38,40 +38,43 @@ var globalEngine *Engine
 
 func main() {
 	dllPath := "onnxruntime.dll"
-	modelPath := "model.onnx" // Uses model.onnx & model.onnx_data
+	modelPath := "model.onnx"
 
-	fmt.Println("🪙 Starting OpenRelief Engine...")
+	fmt.Println("🪙 Starting OpenRelief Studio (Dual 3D View & High-Pass Engine)...")
 	eng, err := initEngine(dllPath, modelPath)
 	if err != nil {
-		fmt.Printf("ERROR: %v\n", err)
-		fmt.Println("Please make sure onnxruntime.dll, model.onnx, and model.onnx_data are in D:\\OpenRelief")
+		fmt.Printf("Initialization Error: %v\n", err)
 		return
 	}
 	defer eng.session.Destroy()
 	globalEngine = eng
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	appURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(htmlContent)
 	})
+	mux.HandleFunc("/api/process", handleProcess)
+	mux.HandleFunc("/api/download", handleDownload)
 
-	http.HandleFunc("/api/process", handleProcess)
-	http.HandleFunc("/api/download", handleDownload)
+	go http.Serve(listener, mux)
 
-	port := 8080
-	url := fmt.Sprintf("http://localhost:%d", port)
-	fmt.Printf("✅ OpenRelief is running at %s\n", url)
-
-	go openBrowser(url)
-
-	err = http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
-	if err != nil {
-		fmt.Printf("Server Error: %v\n", err)
-	}
+	w := webview.New(false)
+	defer w.Destroy()
+	w.SetTitle("OpenRelief Studio - Base vs Filtered 3D Relief Studio")
+	w.SetSize(1380, 920, webview.HintNone)
+	w.Navigate(appURL)
+	w.Run()
 }
 
 func initEngine(dllPath, modelPath string) (*Engine, error) {
-	// Force absolute paths to prevent Windows from loading System32 dll
 	absDllPath, err := filepath.Abs(dllPath)
 	if err != nil {
 		return nil, err
@@ -108,26 +111,47 @@ func initEngine(dllPath, modelPath string) (*Engine, error) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			fmt.Printf("Server Panic: %v\n", rec)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Processing error: %v", rec)})
+		}
+	}()
+
 	globalEngine.mu.Lock()
 	defer globalEngine.mu.Unlock()
 
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
 	file, _, err := r.FormFile("image")
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read image file: " + err.Error()})
 		return
 	}
 	defer file.Close()
 
-	hpStr := r.FormValue("hpStrength")
-	hpStrength, _ := strconv.ParseFloat(hpStr, 64)
+	hpRadius, _ := strconv.ParseFloat(r.FormValue("hpRadius"), 64)
+	if hpRadius <= 0 {
+		hpRadius = 3.5
+	}
+	hpStrength, _ := strconv.ParseFloat(r.FormValue("hpStrength"), 64)
+	isCoinMask := r.FormValue("coinMask") == "true"
+	isInvert := r.FormValue("invert") == "true"
 
 	srcImg, err := imaging.Decode(file)
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode image: " + err.Error()})
 		return
 	}
 
 	origW, origH := srcImg.Bounds().Dx(), srcImg.Bounds().Dy()
+
+	// 1. AI BASE DEPTH MAP
 	resized := imaging.Resize(srcImg, ModelInputSize, ModelInputSize, imaging.Lanczos)
 	tensorData := globalEngine.inputTensor.GetData()
 
@@ -136,15 +160,15 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	for y := 0; y < ModelInputSize; y++ {
 		for x := 0; x < ModelInputSize; x++ {
-			r, g, b, _ := resized.At(x, y).RGBA()
-			tensorData[0*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(r>>8)/255.0 - mean[0]) / std[0]
-			tensorData[1*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(g>>8)/255.0 - mean[1]) / std[1]
-			tensorData[2*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(b>>8)/255.0 - mean[2]) / std[2]
+			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+			tensorData[0*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
+			tensorData[1*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
+			tensorData[2*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
 		}
 	}
 
 	if err := globalEngine.session.Run(); err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"error": "ONNX Model error: " + err.Error()})
 		return
 	}
 
@@ -167,33 +191,91 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	finalDepth := imaging.Resize(depth518, origW, origH, imaging.Lanczos)
-	blurredOrig := imaging.Blur(srcImg, 4.0)
+	layer1_DepthMap := imaging.Resize(depth518, origW, origH, imaging.Lanczos)
 
+	// 2. HIGH PASS TOP LAYER (From Original Image)
+	origGray := imaging.Grayscale(srcImg)
+	origBlurred := imaging.Blur(origGray, hpRadius)
+
+	hpVisualizer := image.NewGray(image.Rect(0, 0, origW, origH))
+	baseDepthVisualizer := image.NewGray16(image.Rect(0, 0, origW, origH))
 	result16Bit := image.NewGray16(image.Rect(0, 0, origW, origH))
+
+	centerX, centerY := float64(origW)/2.0, float64(origH)/2.0
+	radius := math.Min(centerX, centerY) - 4.0
+
+	// 3. COLOR-TO-ALPHA COMPOSITING OVER BASE DEPTH
 	for y := 0; y < origH; y++ {
 		for x := 0; x < origW; x++ {
-			dVal := float64(color.Gray16Model.Convert(finalDepth.At(x, y)).(color.Gray16).Y) / 65535.0
-			oVal := float64(color.GrayModel.Convert(srcImg.At(x, y)).(color.Gray).Y) / 255.0
-			bVal := float64(color.GrayModel.Convert(blurredOrig.At(x, y)).(color.Gray).Y) / 255.0
+			dr, _, _, _ := layer1_DepthMap.At(x, y).RGBA()
+			dVal := float64(dr) / 65535.0
 
-			highPass := oVal - bVal
-			blended := math.Min(1.0, math.Max(0.0, dVal+(highPass*hpStrength)))
-			result16Bit.SetGray16(x, y, color.Gray16{Y: uint16(blended * 65535.0)})
+			gr, _, _, _ := origGray.At(x, y).RGBA()
+			gVal := float64(gr) / 65535.0
+
+			br, _, _, _ := origBlurred.At(x, y).RGBA()
+			bVal := float64(br) / 65535.0
+
+			// High Pass output = 0.5 + (Original - Blurred)
+			hpVal := 0.5 + (gVal - bVal)
+			hpVisualizer.SetGray(x, y, color.Gray{Y: uint8(math.Min(255.0, math.Max(0.0, hpVal*255.0)))})
+
+			// GIMP Color-to-Alpha (#808080) Composited Over Depth
+			var blended float64
+			if hpVal >= 0.5 {
+				alpha := math.Min(1.0, 2.0*(hpVal-0.5)*hpStrength)
+				blended = dVal + alpha*(1.0-dVal)
+			} else {
+				alpha := math.Min(1.0, 2.0*(0.5-hpVal)*hpStrength)
+				blended = dVal - (alpha * dVal)
+			}
+
+			baseVal := dVal
+			if isCoinMask {
+				dist := math.Hypot(float64(x)-centerX, float64(y)-centerY)
+				if dist > radius {
+					blended = 0.0
+					baseVal = 0.0
+				} else if dist > radius-3.5 {
+					blended = 0.92
+					baseVal = 0.92
+				}
+			}
+
+			if isInvert {
+				blended = 1.0 - blended
+				baseVal = 1.0 - baseVal
+			}
+
+			baseDepthVisualizer.SetGray16(x, y, color.Gray16{Y: uint16(math.Min(1.0, math.Max(0.0, baseVal)) * 65535.0)})
+			result16Bit.SetGray16(x, y, color.Gray16{Y: uint16(math.Min(1.0, math.Max(0.0, blended)) * 65535.0)})
 		}
 	}
 
 	id := "current"
 	globalEngine.cache[id] = result16Bit
 
-	thumb := imaging.Resize(result16Bit, 450, 0, imaging.Lanczos)
-	var buf []byte
-	wWriter := &byteWriter{buf: &buf}
-	jpeg.Encode(wWriter, thumb, &jpeg.Options{Quality: 85})
+	// Thumbnails for UI
+	thumbBase := imaging.Resize(baseDepthVisualizer, 450, 0, imaging.Lanczos)
+	var bufBase []byte
+	wBase := &byteWriter{buf: &bufBase}
+	jpeg.Encode(wBase, thumbBase, &jpeg.Options{Quality: 85})
+
+	thumbHP := imaging.Resize(hpVisualizer, 450, 0, imaging.Lanczos)
+	var bufHP []byte
+	wHP := &byteWriter{buf: &bufHP}
+	jpeg.Encode(wHP, thumbHP, &jpeg.Options{Quality: 85})
+
+	thumbDepth := imaging.Resize(result16Bit, 450, 0, imaging.Lanczos)
+	var bufDepth []byte
+	wDepth := &byteWriter{buf: &bufDepth}
+	jpeg.Encode(wDepth, thumbDepth, &jpeg.Options{Quality: 85})
 
 	json.NewEncoder(w).Encode(map[string]string{
-		"id":      id,
-		"preview": "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf),
+		"id":           id,
+		"basePreview":  "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBase),
+		"hpPreview":    "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufHP),
+		"depthPreview": "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDepth),
 	})
 }
 
@@ -209,14 +291,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Content-Disposition", "attachment; filename=coin_relief_16bit.png")
+	w.Header().Set("Content-Disposition", "attachment; filename=openrelief_16bit.png")
 	png.Encode(w, img)
-}
-
-func openBrowser(url string) {
-	if runtime.GOOS == "windows" {
-		exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	}
 }
 
 type byteWriter struct{ buf *[]byte }
