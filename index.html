@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>🪙 OpenRelief Studio</title>
+  <style>
+    body { font-family: sans-serif; background: #18181b; color: #f4f4f5; margin: 0; padding: 20px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    h2 { text-align: center; color: #fbbf24; }
+    .controls { display: flex; gap: 15px; align-items: center; justify-content: center; background: #27272a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    button { padding: 10px 18px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; background: #3b82f6; color: white; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .slider-box { display: flex; flex-direction: column; font-size: 13px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .card { background: #27272a; padding: 15px; border-radius: 8px; text-align: center; }
+    .img-box { height: 380px; display: flex; align-items: center; justify-content: center; background: #09090b; border-radius: 6px; overflow: hidden; }
+    img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    #status { text-align: center; margin-top: 15px; color: #a1a1aa; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🪙 OpenRelief - 16-Bit Depth Studio</h2>
+    <div class="controls">
+      <input type="file" id="fileInput" accept="image/*" style="display:none">
+      <button onclick="document.getElementById('fileInput').click()">📁 Select Image</button>
+      <div class="slider-box">
+        <label>Edge Sharpness: <span id="hpVal">0.25</span></label>
+        <input type="range" id="hpSlider" min="0.0" max="0.8" step="0.05" value="0.25">
+      </div>
+      <a id="downloadLink" style="display:none"><button style="background:#10b981">💾 Download 16-Bit PNG (ZBrush)</button></a>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h4>Original Artwork</h4>
+        <div class="img-box"><img id="origImg" style="display:none"><span id="origPlaceholder">No image selected</span></div>
+      </div>
+      <div class="card">
+        <h4>16-Bit Depth Preview</h4>
+        <div class="img-box"><img id="depthImg" style="display:none"><span id="depthPlaceholder">Waiting for image...</span></div>
+      </div>
+    </div>
+    <div id="status">Ready</div>
+  </div>
+
+  <script>
+    let currentFile = null;
+    const fileInput = document.getElementById('fileInput');
+    const hpSlider = document.getElementById('hpSlider');
+    const hpVal = document.getElementById('hpVal');
+    const status = document.getElementById('status');
+    const origImg = document.getElementById('origImg');
+    const depthImg = document.getElementById('depthImg');
+    const downloadLink = document.getElementById('downloadLink');
+
+    fileInput.onchange = (e) => {
+      if (e.target.files.length > 0) {
+        currentFile = e.target.files[0];
+        origImg.src = URL.createObjectURL(currentFile);
+        origImg.style.display = 'block';
+        document.getElementById('origPlaceholder').style.display = 'none';
+        processImage();
+      }
+    };
+
+    hpSlider.oninput = () => { hpVal.innerText = hpSlider.value; };
+    hpSlider.onchange = () => { if (currentFile) processImage(); };
+
+    async function processImage() {
+      status.innerText = "⚡ Computing 16-Bit Depth in Go ONNX...";
+      const formData = new FormData();
+      formData.append("image", currentFile);
+      formData.append("hpStrength", hpSlider.value);
+
+      try {
+        const res = await fetch("/api/process", { method: "POST", body: formData });
+        const data = await res.json();
+        if (data.error) throw data.error;
+
+        depthImg.src = data.preview;
+        depthImg.style.display = 'block';
+        document.getElementById('depthPlaceholder').style.display = 'none';
+
+        downloadLink.href = "/api/download?id=" + data.id;
+        downloadLink.download = "coin_relief_16bit.png";
+        downloadLink.style.display = 'inline-block';
+        status.innerText = "Done! Ready to download 16-bit PNG for ZBrush.";
+      } catch (err) {
+        status.innerText = "Error: " + err;
+      }
+    }
+  </script>
+</body>
+</html>

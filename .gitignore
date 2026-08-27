@@ -1,0 +1,21 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# ONNX Model weights (recommend users download separately or use Git LFS)
+*.onnx
+models/*.onnx
+
+# Temporary generated files
+depth_preview.png
+*.tmp
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+model.onnx_data
