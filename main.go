@@ -26,7 +26,8 @@ var htmlContent []byte
 
 const ModelInputSize = 518
 const ShadowInputSize = 512
-const NafnetInputSize = 512 // NAFNet Restoration patch size
+const NafnetInputSize = 512
+const U2NetInputSize = 320 // U-2-Net standard resolution
 
 type Engine struct {
 	session      *ort.AdvancedSession
@@ -38,7 +39,8 @@ type Engine struct {
 
 var globalDepthEngine *Engine
 var globalShadowEngines = make(map[string]*Engine)
-var globalNafnetEngine *Engine // NEW: NAFNet HD Restoration Engine
+var globalNafnetEngine *Engine
+var globalBgrEngine *Engine // NEW: U-2-Net Background Removal Engine
 
 func main() {
 	dllPath := "onnxruntime.dll"
@@ -88,6 +90,21 @@ func main() {
 		fmt.Println("Loaded HD Restoration Model: nafnet.onnx")
 	}
 
+	// Load U-2-Net Background Removal Model (u2net.onnx or u2netp.onnx)
+	u2netPath := filepath.Join("models", "u2net.onnx")
+	globalBgrEngine, err = initEngine(u2netPath, U2NetInputSize, U2NetInputSize, 1)
+	if err != nil {
+		// Fallback check for u2netp.onnx
+		u2netPath = filepath.Join("models", "u2netp.onnx")
+		globalBgrEngine, err = initEngine(u2netPath, U2NetInputSize, U2NetInputSize, 1)
+	}
+	if err != nil {
+		fmt.Printf("Notice: Could not load u2net.onnx (%v). Background Removal disabled.\n", err)
+	} else {
+		defer globalBgrEngine.session.Destroy()
+		fmt.Println("Loaded Background Removal Model: u2net.onnx")
+	}
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
@@ -114,14 +131,13 @@ func main() {
 	w.Run()
 }
 
-// Updated Init Engine to handle different output channels (1 for Depth, 3 for Shadow RGB)
+// Dynamic Init Engine that auto-detects tensor ranks (Fixes Rank 3 vs 4 mismatch)
 func initEngine(modelPath string, width int, height int, outChannels int) (*Engine, error) {
 	absModelPath, err := filepath.Abs(modelPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Auto-detect the exact tensor names from the ONNX file metadata
 	inInfo, outInfo, err := ort.GetInputOutputInfo(absModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metadata for %s: %w", modelPath, err)
@@ -129,15 +145,44 @@ func initEngine(modelPath string, width int, height int, outChannels int) (*Engi
 	inputName := inInfo[0].Name
 	outputName := outInfo[0].Name
 
-	inputShape := ort.NewShape(1, 3, int64(width), int64(height))
-	var outputShape ort.Shape
-	if outChannels == 1 {
-		outputShape = ort.NewShape(1, int64(width), int64(height))
-	} else {
-		outputShape = ort.NewShape(1, int64(outChannels), int64(width), int64(height))
+	// Dynamic Shape Reconstruction
+	inShapeDims := inInfo[0].Dimensions
+	for i, d := range inShapeDims {
+		if d <= 0 {
+			if i == 0 { inShapeDims[i] = 1 }
+			if i == 1 { inShapeDims[i] = 3 }
+			if i == 2 { inShapeDims[i] = int64(height) }
+			if i == 3 { inShapeDims[i] = int64(width) }
+		}
+	}
+	if len(inShapeDims) == 0 {
+		inShapeDims = []int64{1, 3, int64(width), int64(height)}
 	}
 
-	inTensor, _ := ort.NewTensor(inputShape, make([]float32, 1*3*width*height))
+	outShapeDims := outInfo[0].Dimensions
+	for i, d := range outShapeDims {
+		if d <= 0 {
+			if i == 0 { outShapeDims[i] = 1 }
+			if i == 1 && len(outShapeDims) == 4 { outShapeDims[i] = int64(outChannels) }
+			if i == len(outShapeDims)-2 { outShapeDims[i] = int64(height) }
+			if i == len(outShapeDims)-1 { outShapeDims[i] = int64(width) }
+		}
+	}
+	if len(outShapeDims) == 0 {
+		if outChannels == 1 {
+			outShapeDims = []int64{1, 1, int64(width), int64(height)}
+		} else {
+			outShapeDims = []int64{1, int64(outChannels), int64(width), int64(height)}
+		}
+	}
+
+	inputShape := ort.NewShape(inShapeDims...)
+	outputShape := ort.NewShape(outShapeDims...)
+
+	var totalIn int64 = 1
+	for _, dim := range inShapeDims { totalIn *= dim }
+
+	inTensor, _ := ort.NewTensor(inputShape, make([]float32, totalIn))
 	outTensor, _ := ort.NewEmptyTensor[float32](outputShape)
 
 	session, err := ort.NewAdvancedSession(absModelPath,
@@ -244,6 +289,79 @@ func runNafnetRestoration(img image.Image, engine *Engine) image.Image {
 	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
 }
 
+// NEW: Native Go ONNX U-2-Net Background Removal
+func runBackgroundRemoval(img image.Image, engine *Engine) image.Image {
+	if engine == nil {
+		fmt.Println("U-2-Net Engine not available, skipping...")
+		return img
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	resized := imaging.Resize(img, U2NetInputSize, U2NetInputSize, imaging.Lanczos)
+	tensorData := engine.inputTensor.GetData()
+
+	mean := []float32{0.485, 0.456, 0.406}
+	std := []float32{0.229, 0.224, 0.225}
+
+	// Normalize ImageNet tensors
+	for y := 0; y < U2NetInputSize; y++ {
+		for x := 0; x < U2NetInputSize; x++ {
+			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+			tensorData[0*U2NetInputSize*U2NetInputSize+y*U2NetInputSize+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
+			tensorData[1*U2NetInputSize*U2NetInputSize+y*U2NetInputSize+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
+			tensorData[2*U2NetInputSize*U2NetInputSize+y*U2NetInputSize+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
+		}
+	}
+
+	if err := engine.session.Run(); err != nil {
+		fmt.Println("U-2-Net ONNX Run Error:", err)
+		return img
+	}
+
+	rawMask := engine.outputTensor.GetData()
+	minM, maxM := float32(math.MaxFloat32), float32(-math.MaxFloat32)
+	for _, v := range rawMask {
+		if v < minM { minM = v }
+		if v > maxM { maxM = v }
+	}
+	diffM := maxM - minM
+	if diffM == 0 { diffM = 1 }
+
+	// Create Alpha Mask
+	maskImg := image.NewGray(image.Rect(0, 0, U2NetInputSize, U2NetInputSize))
+	for y := 0; y < U2NetInputSize; y++ {
+		for x := 0; x < U2NetInputSize; x++ {
+			norm := (rawMask[y*U2NetInputSize+x] - minM) / diffM
+			val := uint8(math.Min(255, math.Max(0, float64(norm)*255.0)))
+			if norm < 0.25 { val = 0 } // Hard cutoff for clean backgrounds
+			maskImg.SetGray(x, y, color.Gray{Y: val})
+		}
+	}
+
+	// Resize mask to original image dimensions
+	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
+	fullMask := imaging.Resize(maskImg, origW, origH, imaging.Lanczos)
+	outImg := image.NewRGBA(image.Rect(0, 0, origW, origH))
+
+	// Apply Mask: background becomes pure black
+	for y := 0; y < origH; y++ {
+		for x := 0; x < origW; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			mVal, _, _, _ := fullMask.At(x, y).RGBA()
+			alphaRatio := float64(mVal>>8) / 255.0
+
+			outR := uint8(float64(r>>8) * alphaRatio)
+			outG := uint8(float64(g>>8) * alphaRatio)
+			outB := uint8(float64(b>>8) * alphaRatio)
+			outImg.SetRGBA(x, y, color.RGBA{R: outR, G: outG, B: outB, A: 255})
+		}
+	}
+
+	return outImg
+}
+
 // Helper: Run inference on a single image patch (Depth)
 func runInference(img image.Image) [][]float64 {
 	resized := imaging.Resize(img, ModelInputSize, ModelInputSize, imaging.Lanczos)
@@ -345,8 +463,9 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	isCoinMask := r.FormValue("coinMask") == "true"
 	isInvert := r.FormValue("invert") == "true"
 	removeShadows := r.FormValue("removeShadows") == "true"
-	hdRestoration := r.FormValue("hdRestoration") == "true" // NEW
-	targetDim := r.FormValue("targetDim")                   // NEW: "original", "2k", or "4k"
+	removeBg := r.FormValue("removeBg") == "true" // NEW: Background Removal toggle
+	hdRestoration := r.FormValue("hdRestoration") == "true"
+	targetDim := r.FormValue("targetDim")
 
 	srcImg, err := imaging.Decode(file)
 	if err != nil {
@@ -355,6 +474,12 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var delightBase64 string
+	var bgBase64 string
+	tileDensity, _ := strconv.Atoi(r.FormValue("tileDensity"))
+	if tileDensity < 2 || tileDensity > 4 {
+		tileDensity = 2 // Default 2x2
+	}
+
 	// --- STEP 2: Go-Native AI Shadow Removal ---
 	if removeShadows {
 		shadowModelName := r.FormValue("shadowModel")
@@ -367,12 +492,24 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		srcImg = runShadowRemoval(srcImg, selectedEngine)
 		fmt.Println("[+] Shadows removed!")
 
-		// Generate preview of the shadow-removed image
 		thumbDelight := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
 		var bufDelight []byte
 		wDelight := &byteWriter{buf: &bufDelight}
 		jpeg.Encode(wDelight, thumbDelight, &jpeg.Options{Quality: 85})
 		delightBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDelight)
+	}
+
+	// --- STEP 2.5: U-2-Net Background Removal ---
+	if removeBg && globalBgrEngine != nil {
+		fmt.Println("[*] Running U-2-Net Background Removal...")
+		srcImg = runBackgroundRemoval(srcImg, globalBgrEngine)
+		fmt.Println("[+] Background successfully removed!")
+
+		thumbBg := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
+		var bufBg []byte
+		wBg := &byteWriter{buf: &bufBg}
+		jpeg.Encode(wBg, thumbBg, &jpeg.Options{Quality: 85})
+		bgBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBg)
 	}
 
 	// --- STEP 3 (Stage A): NAFNet HD Restoration (Deblur & Denoise) ---
@@ -398,6 +535,13 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			origW, origH = newW, newH
 		}
 	}
+
+	// Generate preview of the HD Upscaled / Restored image
+	thumbUpscale := imaging.Resize(srcImg, 650, 0, imaging.Lanczos)
+	var bufUpscale []byte
+	wUpscale := &byteWriter{buf: &bufUpscale}
+	jpeg.Encode(wUpscale, thumbUpscale, &jpeg.Options{Quality: 90})
+	upscaleBase64 := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufUpscale)
 
 	globalDepthEngine.mu.Lock()
 	defer globalDepthEngine.mu.Unlock()
@@ -429,17 +573,25 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if useTiling {
-		numX, numY := 2, 2
+		numX, numY := tileDensity, tileDensity
 		tileW := origW / numX
 		tileH := origH / numY
 
-		xCoords := []int{0, origW - tileW}
-		if numX > 1 {
-			xCoords = append(xCoords, tileW/2)
+		var xCoords []int
+		for i := 0; i < numX; i++ {
+			xCoords = append(xCoords, i*(origW-tileW)/max(1, numX-1))
 		}
-		yCoords := []int{0, origH - tileH}
-		if numY > 1 {
-			yCoords = append(yCoords, tileH/2)
+		// Add overlapping center coordinates
+		for i := 0; i < numX-1; i++ {
+			xCoords = append(xCoords, i*tileW+tileW/2)
+		}
+
+		var yCoords []int
+		for j := 0; j < numY; j++ {
+			yCoords = append(yCoords, j*(origH-tileH)/max(1, numY-1))
+		}
+		for j := 0; j < numY-1; j++ {
+			yCoords = append(yCoords, j*tileH+tileH/2)
 		}
 
 		for _, ty := range yCoords {
@@ -594,6 +746,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"id":             id,
 		"delightPreview": delightBase64,
+		"bgPreview":      bgBase64,
+		"upscalePreview": upscaleBase64,
 		"basePreview":    "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBase),
 		"hpPreview":      "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufHP),
 		"depthPreview":   "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDepth),
@@ -623,7 +777,7 @@ func (b *byteWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// NEW: Reports which AI models are loaded or missing
+// Reports which AI models are loaded or missing
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -633,8 +787,9 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"depthLoaded":  globalDepthEngine != nil,
-		"nafnetLoaded": globalNafnetEngine != nil,
-		"shadowModels": loadedShadows,
+		"depthLoaded":   globalDepthEngine != nil,
+		"nafnetLoaded":  globalNafnetEngine != nil,
+		"u2netLoaded":   globalBgrEngine != nil, // NEW
+		"shadowModels":  loadedShadows,
 	})
 }

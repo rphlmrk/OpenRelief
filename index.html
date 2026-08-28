@@ -11,17 +11,27 @@
       box-sizing: border-box;
     }
 
+    html {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0d0d0e;
+      zoom: 0.9; /* Scales the viewport correctly without breaking fullscreen bounds */
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #0d0d0e;
       color: #ededef;
       margin: 0;
       padding: 0;
-      height: 100vh;
+      width: 100%;
+      height: 100%;
       display: flex;
       overflow: hidden;
       user-select: none;
-      zoom: 0.9; /* Default 90% zoom */
     }
 
     /* ---------------- LEFT SIDEBAR ---------------- */
@@ -32,7 +42,7 @@
       border-right: 1px solid #232326;
       display: flex;
       flex-direction: column;
-      height: 100vh;
+      height: 100%;
       overflow: hidden;
     }
 
@@ -216,7 +226,7 @@
     /* ---------------- RIGHT MAIN WORKSPACE ---------------- */
     .main-workspace {
       flex: 1;
-      height: 100vh;
+      height: 100%;
       overflow-y: auto;
       padding: 16px;
       display: flex;
@@ -234,10 +244,21 @@
     }
 
     .grid-row1 {
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      display: flex;
       gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 6px;
     }
+
+    .grid-row1 .card {
+      min-width: 170px;
+      max-width: 200px;
+      flex: 1;
+    }
+
+    /* Custom sleek scrollbar for 2D cards */
+    .grid-row1::-webkit-scrollbar { height: 5px; }
+    .grid-row1::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; }
 
     .grid-row2 {
       display: grid;
@@ -304,6 +325,47 @@
       border: 1px solid #333;
       z-index: 10;
     }
+
+    /* HD Lightbox Modal */
+    .img-box-2d { cursor: zoom-in; }
+    
+    #lightboxModal {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(0, 0, 0, 0.88);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      backdrop-filter: blur(6px);
+    }
+
+    #lightboxImg {
+      max-width: 90vw;
+      max-height: 85vh;
+      object-fit: contain;
+      border-radius: 8px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+      border: 1px solid #3f3f46;
+    }
+
+    #lightboxTitle {
+      color: #fbbf24;
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    #lightboxClose {
+      position: absolute;
+      top: 20px; right: 30px;
+      color: #a1a1aa;
+      font-size: 28px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    #lightboxClose:hover { color: white; }
   </style>
 </head>
 
@@ -339,6 +401,10 @@
           </select>
         </div>
 
+        <label class="checkbox-box" title="Runs U-2-Net to isolate foreground coin emblem and flatten background">
+          <input type="checkbox" id="removeBgCheck"> ✂️ Background Removal (U-2-Net)
+        </label>
+
         <label class="checkbox-box" title="Runs NAFNet to deblur edges">
           <input type="checkbox" id="hdRestorationCheck" checked> 💎 HD Restoration (NAFNet)
         </label>
@@ -357,9 +423,16 @@
       <div class="control-group">
         <div class="group-title">Relief Geometry &amp; Tiling</div>
 
-        <label class="checkbox-box" title="Runs overlapping 2x2 tile inference">
-          <input type="checkbox" id="useTilingCheck" checked> Multi-Scale Tiling
-        </label>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <label class="checkbox-box" title="Runs overlapping hierarchical tile inference">
+            <input type="checkbox" id="useTilingCheck" checked> Multi-Scale Tiling
+          </label>
+          <select id="tileDensitySelect" class="mat-select" style="width: 110px;">
+            <option value="2" selected>2×2 (4 Tiles)</option>
+            <option value="3">3×3 (9 Tiles)</option>
+            <option value="4">4×4 (16 Tiles)</option>
+          </select>
+        </div>
 
         <div class="slider-box">
           <label>Bas-Relief Flatten: <span id="flattenVal">0.40</span></label>
@@ -415,6 +488,10 @@
             <span id="tagDepth" class="tag-ok">Checking...</span>
           </div>
           <div class="health-tag">
+            <span>U-2-Net Cutout:</span>
+            <span id="tagU2net" class="tag-ok">Checking...</span>
+          </div>
+          <div class="health-tag">
             <span>NAFNet Deblur:</span>
             <span id="tagNafnet" class="tag-ok">Checking...</span>
           </div>
@@ -458,15 +535,23 @@
           <div class="img-box-2d"><img id="delightImg" style="display:none"><span id="delightPlaceholder">Shadows Off</span></div>
         </div>
         <div class="card">
-          <h4>3. Base Depth</h4>
+          <h4>3. Cutout (No BG)</h4>
+          <div class="img-box-2d"><img id="bgImg" style="display:none"><span id="bgPlaceholder">BG Active</span></div>
+        </div>
+        <div class="card">
+          <h4>4. HD Upscaled</h4>
+          <div class="img-box-2d"><img id="upscaleImg" style="display:none"><span id="upscalePlaceholder">1× Original</span></div>
+        </div>
+        <div class="card">
+          <h4>5. Base Depth</h4>
           <div class="img-box-2d"><img id="baseImg" style="display:none"><span id="basePlaceholder">Waiting...</span></div>
         </div>
         <div class="card">
-          <h4>4. High-Pass</h4>
+          <h4>6. High-Pass</h4>
           <div class="img-box-2d"><img id="hpImg" style="display:none"><span id="hpPlaceholder">Waiting...</span></div>
         </div>
         <div class="card">
-          <h4>5. Master 16-Bit</h4>
+          <h4>7. Master 16-Bit</h4>
           <div class="img-box-2d"><img id="depthImg" style="display:none"><span id="depthPlaceholder">Waiting...</span></div>
         </div>
       </div>
@@ -520,6 +605,7 @@
     const removeShadowsCheck = document.getElementById('removeShadowsCheck');
     const shadowModelSelect = document.getElementById('shadowModelSelect');
     const shadowModelBox = document.getElementById('shadowModelBox');
+    const removeBgCheck = document.getElementById('removeBgCheck'); // NEW
     const hdRestorationCheck = document.getElementById('hdRestorationCheck');
     const dimensionSelect = document.getElementById('dimensionSelect');
     const statusText = document.getElementById('statusText');
@@ -533,20 +619,24 @@
 
     const origImg = document.getElementById('origImg');
     const delightImg = document.getElementById('delightImg');
+    const upscaleImg = document.getElementById('upscaleImg');
+    const bgImg = document.getElementById('bgImg');
+    const tileDensitySelect = document.getElementById('tileDensitySelect');
     const baseImg = document.getElementById('baseImg');
     const hpImg = document.getElementById('hpImg');
     const depthImg = document.getElementById('depthImg');
     const btnPng = document.getElementById('btnPng');
     const matSelect = document.getElementById('matSelect');
 
-    // Set 90% Default Zoom
-    document.body.style.zoom = "0.9";
+    // Set 90% Default Zoom on documentElement (preserves fullscreen responsiveness)
+    document.documentElement.style.zoom = "0.9";
 
     // UI Zoom Functionality
     zoomSlider.oninput = () => {
       const z = zoomSlider.value;
       zoomVal.innerText = z + "%";
-      document.body.style.zoom = z / 100.0;
+      document.documentElement.style.zoom = z / 100.0;
+      update3DViewportsSize();
     };
 
     // Check Model Health & Missing Models on Startup
@@ -563,6 +653,18 @@
         } else {
           tagDepth.innerText = "⚠️ Missing (anything v2.onnx)";
           tagDepth.className = "tag-missing";
+        }
+
+        // Check U-2-Net Model
+        const tagU2net = document.getElementById("tagU2net");
+        if (data.u2netLoaded) {
+          tagU2net.innerText = "Active (u2net.onnx)";
+          tagU2net.className = "tag-ok";
+        } else {
+          tagU2net.innerText = "⚠️ Missing (u2net.onnx)";
+          tagU2net.className = "tag-missing";
+          removeBgCheck.checked = false;
+          removeBgCheck.disabled = true;
         }
 
         // Check NAFNet Model
@@ -625,7 +727,7 @@
       if (currentFile) processImage();
     };
 
-    shadowModelSelect.onchange = hdRestorationCheck.onchange = dimensionSelect.onchange = () => {
+    removeBgCheck.onchange = shadowModelSelect.onchange = hdRestorationCheck.onchange = dimensionSelect.onchange = tileDensitySelect.onchange = () => {
       if (currentFile) processImage();
     };
 
@@ -645,12 +747,14 @@
       const formData = new FormData();
       formData.append("image", currentFile);
       formData.append("useTiling", useTilingCheck.checked);
+      formData.append("tileDensity", tileDensitySelect.value); // NEW: 2, 3, or 4
       formData.append("hpStrength", hpSlider.value);
       formData.append("reliefFlatten", flattenSlider.value);
       formData.append("bodyInflation", inflateSlider.value);
       formData.append("coinMask", coinMaskCheck.checked);
       formData.append("invert", invertCheck.checked);
       formData.append("removeShadows", removeShadowsCheck.checked);
+      formData.append("removeBg", removeBgCheck.checked);
       formData.append("shadowModel", shadowModelSelect.value);
       formData.append("hdRestoration", hdRestorationCheck.checked);
       formData.append("targetDim", dimensionSelect.value);
@@ -668,6 +772,27 @@
         } else {
           delightImg.style.display = 'none';
           document.getElementById('delightPlaceholder').style.display = 'block';
+        }
+
+        // Update Cutout / Background Removed View
+        if (data.bgPreview) {
+          bgImg.src = data.bgPreview;
+          bgImg.style.display = 'block';
+          document.getElementById('bgPlaceholder').style.display = 'none';
+        } else {
+          bgImg.style.display = 'none';
+          document.getElementById('bgPlaceholder').style.display = 'block';
+        }
+
+        // Update Upscaled / Restored View
+        if (data.upscalePreview) {
+          upscaleImg.src = data.upscalePreview;
+          upscaleImg.style.display = 'block';
+          document.getElementById('upscalePlaceholder').style.display = 'none';
+          currentUpscaleSrc = data.upscalePreview;
+        } else {
+          upscaleImg.style.display = 'none';
+          document.getElementById('upscalePlaceholder').style.display = 'block';
         }
 
         // Update other 2D previews
@@ -780,6 +905,33 @@
       animate();
     }
 
+    // Responsive function to resize Three.js viewports instantly
+    function update3DViewportsSize() {
+      const containerB = document.getElementById('viewportBase');
+      const containerF = document.getElementById('viewportFilter');
+
+      if (rendererBase && cameraBase && containerB && containerB.clientWidth > 0) {
+        cameraBase.aspect = containerB.clientWidth / containerB.clientHeight;
+        cameraBase.updateProjectionMatrix();
+        rendererBase.setSize(containerB.clientWidth, containerB.clientHeight);
+      }
+      if (rendererFilter && cameraFilter && containerF && containerF.clientWidth > 0) {
+        cameraFilter.aspect = containerF.clientWidth / containerF.clientHeight;
+        cameraFilter.updateProjectionMatrix();
+        rendererFilter.setSize(containerF.clientWidth, containerF.clientHeight);
+      }
+    }
+
+    // Listens to Window Resize and Window Maximize
+    window.addEventListener('resize', update3DViewportsSize);
+
+    // Continuous ResizeObserver for 100% Fullscreen adaptation
+    const ro = new ResizeObserver(() => update3DViewportsSize());
+    const cB = document.getElementById('viewportBase');
+    const cF = document.getElementById('viewportFilter');
+    if (cB) ro.observe(cB);
+    if (cF) ro.observe(cF);
+
     function getMaterial() {
       const type = matSelect.value;
       if (type === 'clay') {
@@ -819,7 +971,12 @@
       ctx.drawImage(baseDepthImg, 0, 0, w, h);
       const imgData = ctx.getImageData(0, 0, w, h).data;
 
-      const geometry = new THREE.PlaneGeometry(55, 55, w - 1, h - 1);
+      // Maintain accurate rectangular aspect ratio for 2K/4K meshes
+      const aspect = baseDepthImg.naturalWidth > 0 ? (baseDepthImg.naturalWidth / baseDepthImg.naturalHeight) : 1.0;
+      const planeW = 55 * aspect;
+      const planeH = 55;
+
+      const geometry = new THREE.PlaneGeometry(planeW, planeH, w - 1, h - 1);
       const pos = geometry.attributes.position;
       const hScale = parseFloat(heightSlider.value) / 10.0;
 
@@ -842,7 +999,12 @@
       ctx.drawImage(filterDepthImg, 0, 0, w, h);
       const imgData = ctx.getImageData(0, 0, w, h).data;
 
-      const geometry = new THREE.PlaneGeometry(55, 55, w - 1, h - 1);
+      // Maintain accurate rectangular aspect ratio for 2K/4K meshes
+      const aspect = filterDepthImg.naturalWidth > 0 ? (filterDepthImg.naturalWidth / filterDepthImg.naturalHeight) : 1.0;
+      const planeW = 55 * aspect;
+      const planeH = 55;
+
+      const geometry = new THREE.PlaneGeometry(planeW, planeH, w - 1, h - 1);
       const pos = geometry.attributes.position;
       const hScale = parseFloat(heightSlider.value) / 10.0;
 
@@ -860,7 +1022,37 @@
       if (meshBase) buildBase3DMesh();
       if (meshFilter) buildFilter3DMesh();
     }
+
+    // Fullscreen HD Lightbox Logic
+    let currentUpscaleSrc = "";
+
+    function openLightbox(imgSrc, title) {
+      if (!imgSrc) return;
+      document.getElementById('lightboxImg').src = imgSrc;
+      document.getElementById('lightboxTitle').innerText = title;
+      document.getElementById('lightboxModal').style.display = 'flex';
+    }
+
+    function closeLightbox() {
+      document.getElementById('lightboxModal').style.display = 'none';
+    }
+
+    // Enable click-to-zoom on all 2D cards
+    origImg.parentElement.onclick = () => openLightbox(origImg.src, "1. Original Input Image");
+    delightImg.parentElement.onclick = () => openLightbox(delightImg.src, "2. Shadow-Removed (Delighted) Image");
+    bgImg.parentElement.onclick = () => openLightbox(bgImg.src, "3. U-2-Net Cutout (No Background)");
+    upscaleImg.parentElement.onclick = () => openLightbox(upscaleImg.src, `4. HD Restored & Upscaled (${dimensionSelect.value.toUpperCase()})`);
+    baseImg.parentElement.onclick = () => openLightbox(baseImg.src, "5. Global Depth Map");
+    hpImg.parentElement.onclick = () => openLightbox(hpImg.src, "6. High-Pass Filter Layer");
+    depthImg.parentElement.onclick = () => openLightbox(depthImg.src, "7. Master 16-Bit Depth Map");
   </script>
+
+  <!-- FULLSCREEN HD LIGHTBOX MODAL -->
+  <div id="lightboxModal" onclick="closeLightbox()">
+    <span id="lightboxClose">&times;</span>
+    <div id="lightboxTitle">HD Preview</div>
+    <img id="lightboxImg" src="">
+  </div>
 </body>
 
 </html>
