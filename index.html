@@ -192,11 +192,65 @@
       cursor: pointer;
     }
 
-    #status {
-      text-align: center;
-      margin-top: 8px;
-      color: #9ca3af;
+    /* Info Panel & Live Status Styling */
+    .info-panel {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      background: #18181b;
+      border: 1px solid #27272a;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+      font-size: 11px;
+    }
+
+    .info-item {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .info-item span.label {
+      color: #71717a;
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .info-item span.value {
+      color: #f4f4f5;
+      font-weight: bold;
+      margin-top: 2px;
       font-size: 12px;
+    }
+
+    #statusBanner {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #27272a;
+      color: #fbbf24;
+      margin-bottom: 12px;
+      transition: all 0.2s;
+    }
+
+    .spinner {
+      display: none;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #52525b;
+      border-top-color: #fbbf24;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
   </style>
 </head>
@@ -263,8 +317,40 @@
         </select>
       </div>
 
+      <!-- Zoom Level Selector -->
+      <div class="slider-box" style="min-width: 90px;">
+        <label>UI Zoom: <span id="zoomVal">100%</span></label>
+        <input type="range" id="zoomSlider" min="70" max="130" step="5" value="100">
+      </div>
+
       <button id="btnPng" class="btn-green" style="display:none" onclick="downloadPNG()">💾 Download 16-Bit PNG (ZBrush
         / Sculptok)</button>
+    </div>
+
+    <!-- Live Status Banner with Spinner -->
+    <div id="statusBanner">
+      <div class="spinner" id="statusSpinner"></div>
+      <span id="statusText">⚡ Ready. Select an artwork to begin.</span>
+    </div>
+
+    <!-- Studio Info Panel -->
+    <div class="info-panel">
+      <div class="info-item">
+        <span class="label">Artwork Dimensions</span>
+        <span class="value" id="infoDimensions">No Image</span>
+      </div>
+      <div class="info-item">
+        <span class="label">Depth Engine</span>
+        <span class="value" id="infoDepthEngine">Depth Anything V2 (ONNX)</span>
+      </div>
+      <div class="info-item">
+        <span class="label">Shadow Status</span>
+        <span class="value" id="infoShadow">Disabled (Raw)</span>
+      </div>
+      <div class="info-item">
+        <span class="label">Last Render Time</span>
+        <span class="value" id="infoTime">--</span>
+      </div>
     </div>
 
     <!-- ROW 1: 2D Heightmaps & Filter Layers -->
@@ -313,7 +399,7 @@
       </div>
     </div>
 
-    <div id="status">Ready. Select an artwork to begin.</div>
+
   </div>
 
   <script>
@@ -340,7 +426,16 @@
     const removeShadowsCheck = document.getElementById('removeShadowsCheck');
     const shadowModelSelect = document.getElementById('shadowModelSelect');
     const shadowModelBox = document.getElementById('shadowModelBox');
-    const status = document.getElementById('status');
+    const statusText = document.getElementById('statusText');
+    const statusSpinner = document.getElementById('statusSpinner');
+    const statusBanner = document.getElementById('statusBanner');
+    const zoomSlider = document.getElementById('zoomSlider');
+    const zoomVal = document.getElementById('zoomVal');
+
+    const infoDimensions = document.getElementById('infoDimensions');
+    const infoShadow = document.getElementById('infoShadow');
+    const infoTime = document.getElementById('infoTime');
+
     const origImg = document.getElementById('origImg');
     const delightImg = document.getElementById('delightImg');
     const baseImg = document.getElementById('baseImg');
@@ -349,11 +444,24 @@
     const btnPng = document.getElementById('btnPng');
     const matSelect = document.getElementById('matSelect');
 
+    // UI Zoom Functionality
+    zoomSlider.oninput = () => {
+      const z = zoomSlider.value;
+      zoomVal.innerText = z + "%";
+      document.body.style.zoom = z / 100.0;
+    };
+
     init3DViewports();
 
     fileInput.onchange = (e) => {
       if (e.target.files.length > 0) {
         currentFile = e.target.files[0];
+        const tempImg = new Image();
+        tempImg.onload = () => {
+          infoDimensions.innerText = `${tempImg.naturalWidth} × ${tempImg.naturalHeight} px`;
+        };
+        tempImg.src = URL.createObjectURL(currentFile);
+
         origImg.src = URL.createObjectURL(currentFile);
         origImg.style.display = 'block';
         document.getElementById('origPlaceholder').style.display = 'none';
@@ -366,6 +474,9 @@
     hpSlider.oninput = () => { hpVal.innerText = hpSlider.value; };
     heightSlider.oninput = () => { heightVal.innerText = heightSlider.value; update3DMeshes(); };
 
+
+
+    // Immediate Auto-Update triggers on Shadow changes
     removeShadowsCheck.onchange = () => {
       shadowModelBox.style.display = removeShadowsCheck.checked ? 'flex' : 'none';
       if (currentFile) processImage();
@@ -380,7 +491,16 @@
     };
 
     async function processImage() {
-      status.innerText = "⚡ Computing Multi-Scale Depth... (This may take longer if AI Shadow Removal is ON)";
+      const startTime = performance.now();
+
+      // Update Status Banner to "Running" state
+      statusSpinner.style.display = "inline-block";
+      statusBanner.style.background = "#1e3a8a";
+      statusBanner.style.color = "#93c5fd";
+      statusText.innerText = removeShadowsCheck.checked
+        ? `⏳ Running AI Shadow Removal (${shadowModelSelect.value}) + Depth Anything V2 Tiling...`
+        : "⏳ Computing Multi-Scale Tiled Depth...";
+
       const formData = new FormData();
       formData.append("image", currentFile);
       formData.append("useTiling", useTilingCheck.checked);
@@ -397,15 +517,21 @@
         const data = await res.json();
         if (data.error) throw data.error;
 
+        // Update Delighted View
         if (data.delightPreview) {
           delightImg.src = data.delightPreview;
           delightImg.style.display = 'block';
           document.getElementById('delightPlaceholder').style.display = 'none';
+          infoShadow.innerText = `Active (${shadowModelSelect.value})`;
+          infoShadow.style.color = "#10b981";
         } else {
           delightImg.style.display = 'none';
           document.getElementById('delightPlaceholder').style.display = 'block';
+          infoShadow.innerText = "Disabled (Raw)";
+          infoShadow.style.color = "#71717a";
         }
 
+        // Update other 2D previews
         baseImg.src = data.basePreview;
         baseImg.style.display = 'block';
         document.getElementById('basePlaceholder').style.display = 'none';
@@ -420,15 +546,27 @@
 
         btnPng.style.display = 'inline-block';
 
+        // Rebuild 3D Meshes
         baseDepthImg.onload = () => buildBase3DMesh();
         baseDepthImg.src = data.basePreview;
 
         filterDepthImg.onload = () => buildFilter3DMesh();
         filterDepthImg.src = data.depthPreview;
 
-        status.innerText = "Done! Clean Multi-Scale 16-Bit Heightmap ready for ZBrush & Sculptok.";
+        // Calculate time taken
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        infoTime.innerText = `${elapsed} seconds`;
+
+        // Update Status to "Complete" state
+        statusSpinner.style.display = "none";
+        statusBanner.style.background = "#064e3b";
+        statusBanner.style.color = "#6ee7b7";
+        statusText.innerText = `✅ Complete! Master 16-Bit Relief generated in ${elapsed}s.`;
       } catch (err) {
-        status.innerText = "Error: " + err;
+        statusSpinner.style.display = "none";
+        statusBanner.style.background = "#7f1d1d";
+        statusBanner.style.color = "#fca5a5";
+        statusText.innerText = "❌ Error: " + err;
       }
     }
 
