@@ -475,9 +475,13 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	var delightBase64 string
 	var bgBase64 string
+	bgOrder := r.FormValue("bgOrder") // "before" or "after" upscale
+	if bgOrder == "" {
+		bgOrder = "after"
+	}
 	tileDensity, _ := strconv.Atoi(r.FormValue("tileDensity"))
 	if tileDensity < 2 || tileDensity > 4 {
-		tileDensity = 2 // Default 2x2
+		tileDensity = 2
 	}
 
 	// --- STEP 2: Go-Native AI Shadow Removal ---
@@ -499,11 +503,11 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		delightBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDelight)
 	}
 
-	// --- STEP 2.5: U-2-Net Background Removal ---
-	if removeBg && globalBgrEngine != nil {
-		fmt.Println("[*] Running U-2-Net Background Removal...")
+	// --- STEP 2.5: U-2-Net Background Removal (If "Before Upscale" selected) ---
+	if removeBg && bgOrder == "before" && globalBgrEngine != nil {
+		fmt.Println("[*] Running U-2-Net Background Removal (Before Upscale)...")
 		srcImg = runBackgroundRemoval(srcImg, globalBgrEngine)
-		fmt.Println("[+] Background successfully removed!")
+		fmt.Println("[+] Background removed!")
 
 		thumbBg := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
 		var bufBg []byte
@@ -534,6 +538,19 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			srcImg = imaging.Resize(srcImg, newW, newH, imaging.Lanczos)
 			origW, origH = newW, newH
 		}
+	}
+
+	// --- STEP 3.5: U-2-Net Background Removal (If "After Upscale" selected - Sharp 2K/4K Cutout) ---
+	if removeBg && bgOrder == "after" && globalBgrEngine != nil {
+		fmt.Println("[*] Running U-2-Net Background Removal AFTER Upscale (Sharp 2K/4K Edges)...")
+		srcImg = runBackgroundRemoval(srcImg, globalBgrEngine)
+		fmt.Println("[+] Post-upscale background removal complete!")
+
+		thumbBg := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
+		var bufBg []byte
+		wBg := &byteWriter{buf: &bufBg}
+		jpeg.Encode(wBg, thumbBg, &jpeg.Options{Quality: 85})
+		bgBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBg)
 	}
 
 	// Generate preview of the HD Upscaled / Restored image

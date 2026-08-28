@@ -326,46 +326,84 @@
       z-index: 10;
     }
 
-    /* HD Lightbox Modal */
+    /* Interactive HD Lightbox Modal with Zoom & Pan */
     .img-box-2d { cursor: zoom-in; }
     
     #lightboxModal {
       display: none;
       position: fixed;
       top: 0; left: 0; width: 100vw; height: 100vh;
-      background: rgba(0, 0, 0, 0.88);
+      background: rgba(0, 0, 0, 0.92);
       z-index: 1000;
       align-items: center;
       justify-content: center;
       flex-direction: column;
-      backdrop-filter: blur(6px);
+      backdrop-filter: blur(8px);
+      overflow: hidden;
     }
 
-    #lightboxImg {
-      max-width: 90vw;
-      max-height: 85vh;
-      object-fit: contain;
-      border-radius: 8px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
-      border: 1px solid #3f3f46;
+    #lightboxHeader {
+      position: absolute;
+      top: 16px; left: 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      z-index: 1010;
     }
 
     #lightboxTitle {
       color: #fbbf24;
       font-size: 14px;
       font-weight: 700;
-      margin-bottom: 10px;
+      letter-spacing: 0.5px;
+    }
+
+    #lightboxHint {
+      color: #a1a1aa;
+      font-size: 11px;
+      background: #18181b;
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid #27272a;
     }
 
     #lightboxClose {
       position: absolute;
-      top: 20px; right: 30px;
-      color: #a1a1aa;
-      font-size: 28px;
+      top: 14px; right: 24px;
+      color: #e4e4e7;
+      font-size: 32px;
       font-weight: bold;
       cursor: pointer;
+      z-index: 1010;
+      line-height: 1;
+      transition: 0.15s;
     }
-    #lightboxClose:hover { color: white; }
+    #lightboxClose:hover { color: #f87171; transform: scale(1.1); }
+
+    #lightboxViewport {
+      width: 90vw;
+      height: 85vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      cursor: grab;
+      position: relative;
+    }
+    #lightboxViewport:active { cursor: grabbing; }
+
+    #lightboxImg {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      border-radius: 6px;
+      box-shadow: 0 12px 50px rgba(0,0,0,0.9);
+      border: 1px solid #333;
+      transform-origin: center center;
+      transition: transform 0.12s ease-out;
+      user-select: none;
+      cursor: zoom-in;
+    }
   </style>
 </head>
 
@@ -404,6 +442,14 @@
         <label class="checkbox-box" title="Runs U-2-Net to isolate foreground coin emblem and flatten background">
           <input type="checkbox" id="removeBgCheck"> ✂️ Background Removal (U-2-Net)
         </label>
+
+        <div class="slider-box" id="bgOrderBox" style="display:none;">
+          <label>Cutout Order:</label>
+          <select id="bgOrderSelect" class="mat-select">
+            <option value="after" selected>After Upscale (Sharp 2K/4K Cutout)</option>
+            <option value="before">Before Upscale (Faster)</option>
+          </select>
+        </div>
 
         <label class="checkbox-box" title="Runs NAFNet to deblur edges">
           <input type="checkbox" id="hdRestorationCheck" checked> 💎 HD Restoration (NAFNet)
@@ -605,7 +651,9 @@
     const removeShadowsCheck = document.getElementById('removeShadowsCheck');
     const shadowModelSelect = document.getElementById('shadowModelSelect');
     const shadowModelBox = document.getElementById('shadowModelBox');
-    const removeBgCheck = document.getElementById('removeBgCheck'); // NEW
+    const removeBgCheck = document.getElementById('removeBgCheck');
+    const bgOrderBox = document.getElementById('bgOrderBox');
+    const bgOrderSelect = document.getElementById('bgOrderSelect');
     const hdRestorationCheck = document.getElementById('hdRestorationCheck');
     const dimensionSelect = document.getElementById('dimensionSelect');
     const statusText = document.getElementById('statusText');
@@ -628,10 +676,8 @@
     const btnPng = document.getElementById('btnPng');
     const matSelect = document.getElementById('matSelect');
 
-    // Set 90% Default Zoom on documentElement (preserves fullscreen responsiveness)
     document.documentElement.style.zoom = "0.9";
 
-    // UI Zoom Functionality
     zoomSlider.oninput = () => {
       const z = zoomSlider.value;
       zoomVal.innerText = z + "%";
@@ -639,13 +685,10 @@
       update3DViewportsSize();
     };
 
-    // Check Model Health & Missing Models on Startup
     async function checkModelHealth() {
       try {
         const res = await fetch("/api/info");
         const data = await res.json();
-
-        // Check Depth Model
         const tagDepth = document.getElementById("tagDepth");
         if (data.depthLoaded) {
           tagDepth.innerText = "Active (anything v2)";
@@ -654,8 +697,6 @@
           tagDepth.innerText = "⚠️ Missing (anything v2.onnx)";
           tagDepth.className = "tag-missing";
         }
-
-        // Check U-2-Net Model
         const tagU2net = document.getElementById("tagU2net");
         if (data.u2netLoaded) {
           tagU2net.innerText = "Active (u2net.onnx)";
@@ -666,8 +707,6 @@
           removeBgCheck.checked = false;
           removeBgCheck.disabled = true;
         }
-
-        // Check NAFNet Model
         const tagNafnet = document.getElementById("tagNafnet");
         if (data.nafnetLoaded) {
           tagNafnet.innerText = "Active (nafnet.onnx)";
@@ -678,8 +717,6 @@
           hdRestorationCheck.checked = false;
           hdRestorationCheck.disabled = true;
         }
-
-        // Check Shadow Models
         const tagShadow = document.getElementById("tagShadow");
         if (data.shadowModels && data.shadowModels.length > 0) {
           tagShadow.innerText = `${data.shadowModels.length} Models Ready`;
@@ -706,7 +743,6 @@
           infoDimensions.innerText = `${tempImg.naturalWidth} × ${tempImg.naturalHeight} px`;
         };
         tempImg.src = URL.createObjectURL(currentFile);
-
         origImg.src = URL.createObjectURL(currentFile);
         origImg.style.display = 'block';
         document.getElementById('origPlaceholder').style.display = 'none';
@@ -719,15 +755,17 @@
     hpSlider.oninput = () => { hpVal.innerText = hpSlider.value; };
     heightSlider.oninput = () => { heightVal.innerText = heightSlider.value; update3DMeshes(); };
 
-
-
-    // Immediate Auto-Update triggers on Shadow changes
     removeShadowsCheck.onchange = () => {
       shadowModelBox.style.display = removeShadowsCheck.checked ? 'flex' : 'none';
       if (currentFile) processImage();
     };
 
-    removeBgCheck.onchange = shadowModelSelect.onchange = hdRestorationCheck.onchange = dimensionSelect.onchange = tileDensitySelect.onchange = () => {
+    removeBgCheck.onchange = () => {
+      bgOrderBox.style.display = removeBgCheck.checked ? 'block' : 'none';
+      if (currentFile) processImage();
+    };
+
+    bgOrderSelect.onchange = shadowModelSelect.onchange = hdRestorationCheck.onchange = dimensionSelect.onchange = tileDensitySelect.onchange = () => {
       if (currentFile) processImage();
     };
 
@@ -737,17 +775,14 @@
 
     async function processImage() {
       const startTime = performance.now();
-      
-      // Update Status Banner to "Running" state
       statusSpinner.style.display = "inline-block";
       statusBanner.style.background = "#1e3a8a";
       statusBanner.style.color = "#93c5fd";
       statusText.innerText = `⏳ Processing: [Shadows: ${removeShadowsCheck.checked ? 'ON' : 'OFF'}] + [NAFNet HD: ${hdRestorationCheck.checked ? 'ON' : 'OFF'}] + [Scale: ${dimensionSelect.value.toUpperCase()}]...`;
-
       const formData = new FormData();
       formData.append("image", currentFile);
       formData.append("useTiling", useTilingCheck.checked);
-      formData.append("tileDensity", tileDensitySelect.value); // NEW: 2, 3, or 4
+      formData.append("tileDensity", tileDensitySelect.value);
       formData.append("hpStrength", hpSlider.value);
       formData.append("reliefFlatten", flattenSlider.value);
       formData.append("bodyInflation", inflateSlider.value);
@@ -755,16 +790,14 @@
       formData.append("invert", invertCheck.checked);
       formData.append("removeShadows", removeShadowsCheck.checked);
       formData.append("removeBg", removeBgCheck.checked);
+      formData.append("bgOrder", bgOrderSelect.value);
       formData.append("shadowModel", shadowModelSelect.value);
       formData.append("hdRestoration", hdRestorationCheck.checked);
       formData.append("targetDim", dimensionSelect.value);
-
       try {
         const res = await fetch("/api/process", { method: "POST", body: formData });
         const data = await res.json();
         if (data.error) throw data.error;
-
-        // Update Delighted View
         if (data.delightPreview) {
           delightImg.src = data.delightPreview;
           delightImg.style.display = 'block';
@@ -773,8 +806,6 @@
           delightImg.style.display = 'none';
           document.getElementById('delightPlaceholder').style.display = 'block';
         }
-
-        // Update Cutout / Background Removed View
         if (data.bgPreview) {
           bgImg.src = data.bgPreview;
           bgImg.style.display = 'block';
@@ -783,118 +814,103 @@
           bgImg.style.display = 'none';
           document.getElementById('bgPlaceholder').style.display = 'block';
         }
-
-        // Update Upscaled / Restored View
         if (data.upscalePreview) {
           upscaleImg.src = data.upscalePreview;
           upscaleImg.style.display = 'block';
           document.getElementById('upscalePlaceholder').style.display = 'none';
-          currentUpscaleSrc = data.upscalePreview;
         } else {
           upscaleImg.style.display = 'none';
           document.getElementById('upscalePlaceholder').style.display = 'block';
         }
-
-        // Update other 2D previews
         baseImg.src = data.basePreview;
         baseImg.style.display = 'block';
         document.getElementById('basePlaceholder').style.display = 'none';
-
         hpImg.src = data.hpPreview;
         hpImg.style.display = 'block';
         document.getElementById('hpPlaceholder').style.display = 'none';
-
         depthImg.src = data.depthPreview;
         depthImg.style.display = 'block';
         document.getElementById('depthPlaceholder').style.display = 'none';
-
+        btnPng.onclick = () => {
+          const a = document.createElement('a');
+          a.href = data.depthPreview;
+          a.download = 'master_relief_depth.png';
+          a.click();
+        };
         btnPng.style.display = 'inline-block';
-
-        // Rebuild 3D Meshes
         baseDepthImg.onload = () => buildBase3DMesh();
         baseDepthImg.src = data.basePreview;
-
         filterDepthImg.onload = () => buildFilter3DMesh();
         filterDepthImg.src = data.depthPreview;
-
-        // Calculate time taken
-        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
-        infoTime.innerText = `${elapsed} seconds`;
-
-        // Update Status to "Complete" state
+        const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+        infoTime.innerText = `${duration}s`;
         statusSpinner.style.display = "none";
-        statusBanner.style.background = "#064e3b";
-        statusBanner.style.color = "#6ee7b7";
-        statusText.innerText = `✅ Complete! Master 16-Bit Relief generated in ${elapsed}s.`;
+        statusBanner.style.background = "#14532d";
+        statusBanner.style.color = "#86efac";
+        statusText.innerText = `✅ Processed in ${duration}s`;
       } catch (err) {
         statusSpinner.style.display = "none";
         statusBanner.style.background = "#7f1d1d";
         statusBanner.style.color = "#fca5a5";
-        statusText.innerText = "❌ Error: " + err;
+        statusText.innerText = "❌ Processing failed!";
+        alert("Error generating relief: " + err);
       }
     }
 
-    function downloadPNG() {
-      window.location.href = "/api/download?id=current";
-    }
-
     function init3DViewports() {
-      const containerBase = document.getElementById('viewportBase');
+      const vpBase = document.getElementById('viewportBase');
       sceneBase = new THREE.Scene();
-      cameraBase = new THREE.PerspectiveCamera(45, containerBase.clientWidth / containerBase.clientHeight, 0.1, 1000);
+      sceneBase.background = new THREE.Color(0x09090b);
+      cameraBase = new THREE.PerspectiveCamera(45, vpBase.clientWidth / vpBase.clientHeight, 0.1, 1000);
       cameraBase.position.set(0, -65, 80);
-
-      rendererBase = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-      rendererBase.setSize(containerBase.clientWidth, containerBase.clientHeight);
-      containerBase.appendChild(rendererBase.domElement);
-
+      rendererBase = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      rendererBase.setSize(vpBase.clientWidth, vpBase.clientHeight);
+      vpBase.appendChild(rendererBase.domElement);
       controlsBase = new THREE.OrbitControls(cameraBase, rendererBase.domElement);
       controlsBase.enableDamping = true;
-
-      const containerFilter = document.getElementById('viewportFilter');
+      const vpFilter = document.getElementById('viewportFilter');
       sceneFilter = new THREE.Scene();
-      cameraFilter = new THREE.PerspectiveCamera(45, containerFilter.clientWidth / containerFilter.clientHeight, 0.1, 1000);
+      sceneFilter.background = new THREE.Color(0x09090b);
+      cameraFilter = new THREE.PerspectiveCamera(45, vpFilter.clientWidth / vpFilter.clientHeight, 0.1, 1000);
       cameraFilter.position.set(0, -65, 80);
-
-      rendererFilter = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-      rendererFilter.setSize(containerFilter.clientWidth, containerFilter.clientHeight);
-      containerFilter.appendChild(rendererFilter.domElement);
-
+      rendererFilter = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      rendererFilter.setSize(vpFilter.clientWidth, vpFilter.clientHeight);
+      vpFilter.appendChild(rendererFilter.domElement);
       controlsFilter = new THREE.OrbitControls(cameraFilter, rendererFilter.domElement);
       controlsFilter.enableDamping = true;
-
       controlsBase.addEventListener('change', () => {
         if (!isSyncingCamera) {
           isSyncingCamera = true;
           cameraFilter.position.copy(cameraBase.position);
           cameraFilter.quaternion.copy(cameraBase.quaternion);
           controlsFilter.target.copy(controlsBase.target);
+          controlsFilter.update();
           isSyncingCamera = false;
         }
       });
-
       controlsFilter.addEventListener('change', () => {
         if (!isSyncingCamera) {
           isSyncingCamera = true;
           cameraBase.position.copy(cameraFilter.position);
           cameraBase.quaternion.copy(cameraFilter.quaternion);
           controlsBase.target.copy(controlsFilter.target);
+          controlsBase.update();
           isSyncingCamera = false;
         }
       });
-
-      [sceneBase, sceneFilter].forEach(s => {
-        const l1 = new THREE.DirectionalLight(0xffffff, 1.4);
-        l1.position.set(1.5, 1.5, 2.5);
-        s.add(l1);
-
-        const l2 = new THREE.DirectionalLight(0x88bbff, 0.5);
-        l2.position.set(-1.5, -1.5, 1.0);
-        s.add(l2);
-
-        s.add(new THREE.AmbientLight(0x505050));
-      });
-
+      const addLights = (scene) => {
+        const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambient);
+        const dir1 = new THREE.DirectionalLight(0xffeedd, 1.4);
+        dir1.position.set(40, -40, 60);
+        scene.add(dir1);
+        const dir2 = new THREE.DirectionalLight(0x88bbff, 0.6);
+        dir2.position.set(-40, 40, 30);
+        scene.add(dir2);
+      };
+      addLights(sceneBase);
+      addLights(sceneFilter);
+      window.addEventListener('resize', () => update3DViewportsSize());
       function animate() {
         requestAnimationFrame(animate);
         controlsBase.update();
@@ -905,62 +921,34 @@
       animate();
     }
 
-    // Responsive function to resize Three.js viewports instantly
     function update3DViewportsSize() {
-      const containerB = document.getElementById('viewportBase');
-      const containerF = document.getElementById('viewportFilter');
-
-      if (rendererBase && cameraBase && containerB && containerB.clientWidth > 0) {
-        cameraBase.aspect = containerB.clientWidth / containerB.clientHeight;
+      const vpBase = document.getElementById('viewportBase');
+      if (vpBase && rendererBase) {
+        cameraBase.aspect = vpBase.clientWidth / vpBase.clientHeight;
         cameraBase.updateProjectionMatrix();
-        rendererBase.setSize(containerB.clientWidth, containerB.clientHeight);
+        rendererBase.setSize(vpBase.clientWidth, vpBase.clientHeight);
       }
-      if (rendererFilter && cameraFilter && containerF && containerF.clientWidth > 0) {
-        cameraFilter.aspect = containerF.clientWidth / containerF.clientHeight;
+      const vpFilter = document.getElementById('viewportFilter');
+      if (vpFilter && rendererFilter) {
+        cameraFilter.aspect = vpFilter.clientWidth / vpFilter.clientHeight;
         cameraFilter.updateProjectionMatrix();
-        rendererFilter.setSize(containerF.clientWidth, containerF.clientHeight);
+        rendererFilter.setSize(vpFilter.clientWidth, vpFilter.clientHeight);
       }
     }
-
-    // Listens to Window Resize and Window Maximize
-    window.addEventListener('resize', update3DViewportsSize);
-
-    // Continuous ResizeObserver for 100% Fullscreen adaptation
-    const ro = new ResizeObserver(() => update3DViewportsSize());
-    const cB = document.getElementById('viewportBase');
-    const cF = document.getElementById('viewportFilter');
-    if (cB) ro.observe(cB);
-    if (cF) ro.observe(cF);
 
     function getMaterial() {
       const type = matSelect.value;
-      if (type === 'clay') {
-        return new THREE.MeshStandardMaterial({
-          color: 0x9e9488,
-          roughness: 0.75,
-          metalness: 0.05,
-          side: THREE.DoubleSide
-        });
-      } else if (type === 'silver') {
-        return new THREE.MeshStandardMaterial({
-          color: 0xd8d8d8,
-          roughness: 0.3,
-          metalness: 0.85,
-          side: THREE.DoubleSide
-        });
-      }
-      return new THREE.MeshStandardMaterial({
-        color: 0xd4af37,
-        roughness: 0.35,
-        metalness: 0.65,
-        side: THREE.DoubleSide
-      });
+      if (type === 'gold') return new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.85, roughness: 0.25 });
+      if (type === 'silver') return new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.2 });
+      if (type === 'bronze') return new THREE.MeshStandardMaterial({ color: 0x8c6239, metalness: 0.7, roughness: 0.4 });
+      if (type === 'clay') return new THREE.MeshStandardMaterial({ color: 0x995533, roughness: 0.85 });
+      return new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.5 });
     }
 
-    function changeMaterial() {
+    matSelect.onchange = () => {
       if (meshBase) meshBase.material = getMaterial();
       if (meshFilter) meshFilter.material = getMaterial();
-    }
+    };
 
     function buildBase3DMesh() {
       if (meshBase) sceneBase.remove(meshBase);
@@ -970,22 +958,17 @@
       canvas.width = w; canvas.height = h;
       ctx.drawImage(baseDepthImg, 0, 0, w, h);
       const imgData = ctx.getImageData(0, 0, w, h).data;
-
-      // Maintain accurate rectangular aspect ratio for 2K/4K meshes
       const aspect = baseDepthImg.naturalWidth > 0 ? (baseDepthImg.naturalWidth / baseDepthImg.naturalHeight) : 1.0;
       const planeW = 55 * aspect;
       const planeH = 55;
-
       const geometry = new THREE.PlaneGeometry(planeW, planeH, w - 1, h - 1);
       const pos = geometry.attributes.position;
       const hScale = parseFloat(heightSlider.value) / 10.0;
-
       for (let i = 0; i < pos.count; i++) {
         const val = imgData[i * 4] / 255.0;
         pos.setZ(i, val * hScale * 8.5);
       }
       geometry.computeVertexNormals();
-
       meshBase = new THREE.Mesh(geometry, getMaterial());
       sceneBase.add(meshBase);
     }
@@ -998,22 +981,17 @@
       canvas.width = w; canvas.height = h;
       ctx.drawImage(filterDepthImg, 0, 0, w, h);
       const imgData = ctx.getImageData(0, 0, w, h).data;
-
-      // Maintain accurate rectangular aspect ratio for 2K/4K meshes
       const aspect = filterDepthImg.naturalWidth > 0 ? (filterDepthImg.naturalWidth / filterDepthImg.naturalHeight) : 1.0;
       const planeW = 55 * aspect;
       const planeH = 55;
-
       const geometry = new THREE.PlaneGeometry(planeW, planeH, w - 1, h - 1);
       const pos = geometry.attributes.position;
       const hScale = parseFloat(heightSlider.value) / 10.0;
-
       for (let i = 0; i < pos.count; i++) {
         const val = imgData[i * 4] / 255.0;
         pos.setZ(i, val * hScale * 8.5);
       }
       geometry.computeVertexNormals();
-
       meshFilter = new THREE.Mesh(geometry, getMaterial());
       sceneFilter.add(meshFilter);
     }
@@ -1023,21 +1001,75 @@
       if (meshFilter) buildFilter3DMesh();
     }
 
-    // Fullscreen HD Lightbox Logic
-    let currentUpscaleSrc = "";
+    let currentScale = 1.0;
+    let panX = 0, panY = 0;
+    let isPanning = false;
+    let startX = 0, startY = 0;
+    const lbModal = document.getElementById('lightboxModal');
+    const lbImg = document.getElementById('lightboxImg');
+    const lbViewport = document.getElementById('lightboxViewport');
+
+    function updateLightboxTransform() {
+      lbImg.style.transform = `translate(${panX}px, ${panY}px) scale(${currentScale})`;
+      lbImg.style.cursor = currentScale > 1.0 ? 'zoom-out' : 'zoom-in';
+      document.getElementById('lightboxHint').innerText = `🔍 Zoom: ${(currentScale * 100).toFixed(0)}% | Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit`;
+    }
 
     function openLightbox(imgSrc, title) {
       if (!imgSrc) return;
-      document.getElementById('lightboxImg').src = imgSrc;
+      lbImg.src = imgSrc;
       document.getElementById('lightboxTitle').innerText = title;
-      document.getElementById('lightboxModal').style.display = 'flex';
+      currentScale = 1.0;
+      panX = 0;
+      panY = 0;
+      updateLightboxTransform();
+      lbModal.style.display = 'flex';
     }
 
     function closeLightbox() {
-      document.getElementById('lightboxModal').style.display = 'none';
+      lbModal.style.display = 'none';
+      currentScale = 1.0;
+      panX = 0;
+      panY = 0;
     }
 
-    // Enable click-to-zoom on all 2D cards
+    lbModal.onclick = (e) => {
+      if (e.target === lbModal) closeLightbox();
+    };
+
+    lbImg.onclick = (e) => {
+      e.stopPropagation();
+      if (e.ctrlKey) {
+        currentScale = Math.max(1.0, currentScale - 0.5);
+      } else {
+        currentScale = Math.min(5.0, currentScale + 0.5);
+      }
+      if (currentScale === 1.0) { panX = 0; panY = 0; }
+      updateLightboxTransform();
+    };
+
+    lbViewport.onmousedown = (e) => {
+      if (currentScale > 1.0) {
+        isPanning = true;
+        startX = e.clientX - panX;
+        startY = e.clientY - panY;
+      }
+    };
+
+    window.onmousemove = (e) => {
+      if (isPanning) {
+        panX = e.clientX - startX;
+        panY = e.clientY - startY;
+        updateLightboxTransform();
+      }
+    };
+
+    window.onmouseup = () => { isPanning = false; };
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && lbModal.style.display === 'flex') closeLightbox();
+    });
+
     origImg.parentElement.onclick = () => openLightbox(origImg.src, "1. Original Input Image");
     delightImg.parentElement.onclick = () => openLightbox(delightImg.src, "2. Shadow-Removed (Delighted) Image");
     bgImg.parentElement.onclick = () => openLightbox(bgImg.src, "3. U-2-Net Cutout (No Background)");
@@ -1047,11 +1079,16 @@
     depthImg.parentElement.onclick = () => openLightbox(depthImg.src, "7. Master 16-Bit Depth Map");
   </script>
 
-  <!-- FULLSCREEN HD LIGHTBOX MODAL -->
-  <div id="lightboxModal" onclick="closeLightbox()">
-    <span id="lightboxClose">&times;</span>
-    <div id="lightboxTitle">HD Preview</div>
-    <img id="lightboxImg" src="">
+  <!-- FULLSCREEN HD LIGHTBOX MODAL WITH ZOOM & PAN -->
+  <div id="lightboxModal">
+    <div id="lightboxHeader">
+      <span id="lightboxTitle">HD Preview</span>
+      <span id="lightboxHint">🔍 Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit</span>
+    </div>
+    <span id="lightboxClose" onclick="closeLightbox()">&times;</span>
+    <div id="lightboxViewport" id="lightboxViewport">
+      <img id="lightboxImg" src="">
+    </div>
   </div>
 </body>
 
