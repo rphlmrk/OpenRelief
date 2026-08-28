@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8">
-  <title>🪙 OpenRelief Studio - ZBrush & Sculptok</title>
+  <title>🪙 OpenRelief Studio - Tiled Multi-Scale Depth Studio</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <style>
@@ -73,7 +73,7 @@
       display: flex;
       flex-direction: column;
       font-size: 11px;
-      min-width: 120px;
+      min-width: 115px;
     }
 
     .slider-box label {
@@ -109,7 +109,6 @@
       letter-spacing: 0.5px;
     }
 
-    /* Row 1: 4 Cards */
     .grid-row1 {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -117,7 +116,6 @@
       margin-bottom: 12px;
     }
 
-    /* Row 2: 2 Side-by-Side 3D Renders */
     .grid-row2 {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -205,24 +203,33 @@
 
 <body>
   <div class="container">
-    <h2>🪙 OpenRelief Studio - 16-Bit Depth & Coin Maker</h2>
+    <h2>🪙 OpenRelief Studio - Tiled Multi-Scale Depth (ZBrush & Sculptok)</h2>
 
     <div class="controls">
       <input type="file" id="fileInput" accept="image/*" style="display:none">
       <button onclick="document.getElementById('fileInput').click()">📁 Select Artwork</button>
 
+      <label class="checkbox-box" title="Runs hierarchical overlapping 2x2 tile inference">
+        <input type="checkbox" id="useTilingCheck" checked> Multi-Scale Tiling
+      </label>
+
       <div class="slider-box">
-        <label>High-Pass Radius: <span id="radiusVal">3.5</span>px</label>
-        <input type="range" id="radiusSlider" min="0.5" max="12.0" step="0.5" value="3.5">
+        <label>Bas-Relief Flatten: <span id="flattenVal">0.40</span></label>
+        <input type="range" id="flattenSlider" min="0.0" max="1.0" step="0.05" value="0.40">
       </div>
 
       <div class="slider-box">
-        <label>Filter Strength: <span id="hpVal">0.40</span></label>
-        <input type="range" id="hpSlider" min="0.0" max="1.2" step="0.05" value="0.40">
+        <label>Body Inflation: <span id="inflateVal">0.30</span></label>
+        <input type="range" id="inflateSlider" min="0.0" max="1.0" step="0.05" value="0.30">
       </div>
 
       <div class="slider-box">
-        <label>3D Relief Height: <span id="heightVal">15</span></label>
+        <label>Detail Strength: <span id="hpVal">0.45</span></label>
+        <input type="range" id="hpSlider" min="0.0" max="1.2" step="0.05" value="0.45">
+      </div>
+
+      <div class="slider-box">
+        <label>3D View Height: <span id="heightVal">15</span></label>
         <input type="range" id="heightSlider" min="2" max="40" step="1" value="15">
       </div>
 
@@ -236,11 +243,15 @@
       </div>
 
       <label class="checkbox-box">
-        <input type="checkbox" id="coinMaskCheck"> Coin Rim (Circle)
+        <input type="checkbox" id="coinMaskCheck"> Coin Rim
       </label>
 
       <label class="checkbox-box">
-        <input type="checkbox" id="invertCheck"> Invert (Die/Mold)
+        <input type="checkbox" id="invertCheck"> Invert
+      </label>
+
+      <label class="checkbox-box" title="Runs Intrinsic AI to remove shadows before depth generation">
+        <input type="checkbox" id="removeShadowsCheck"> ✨ AI Shadow Removal
       </label>
 
       <button id="btnPng" class="btn-green" style="display:none" onclick="downloadPNG()">💾 Download 16-Bit PNG (ZBrush
@@ -264,7 +275,7 @@
         <div class="img-box-2d"><img id="hpImg" style="display:none"><span id="hpPlaceholder">Waiting...</span></div>
       </div>
       <div class="card">
-        <h4>4. Composite 16-Bit Depth</h4>
+        <h4>4. Master 16-Bit Depth</h4>
         <div class="img-box-2d"><img id="depthImg" style="display:none"><span id="depthPlaceholder">Waiting...</span>
         </div>
       </div>
@@ -274,17 +285,17 @@
     <div class="section-title">Step 2: 3D Relief Renders (Synchronized Cameras)</div>
     <div class="grid-row2">
       <div class="card">
-        <h4>Base Render (Smooth 3D Volume)</h4>
+        <h4>Base Render (Macro 3D Volume)</h4>
         <div class="img-box-3d">
           <div id="viewportBase" class="viewport"></div>
-          <div class="badge">Pure AI Depth Map</div>
+          <div class="badge">Low-Res Global Depth</div>
         </div>
       </div>
       <div class="card">
-        <h4>Filter Render (High-Pass Enhanced Relief)</h4>
+        <h4>Tiled Master Render (Multi-Scale Relief)</h4>
         <div class="img-box-3d">
           <div id="viewportFilter" class="viewport"></div>
-          <div class="badge">Filter Superimposed on Base Depth</div>
+          <div class="badge">Hierarchical Tiled + Edge Guided</div>
         </div>
       </div>
     </div>
@@ -297,20 +308,23 @@
     let baseDepthImg = new Image();
     let filterDepthImg = new Image();
 
-    // Three.js instances for Base vs Filter
     let sceneBase, cameraBase, rendererBase, meshBase, controlsBase;
     let sceneFilter, cameraFilter, rendererFilter, meshFilter, controlsFilter;
     let isSyncingCamera = false;
 
     const fileInput = document.getElementById('fileInput');
-    const radiusSlider = document.getElementById('radiusSlider');
-    const radiusVal = document.getElementById('radiusVal');
+    const useTilingCheck = document.getElementById('useTilingCheck');
+    const flattenSlider = document.getElementById('flattenSlider');
+    const flattenVal = document.getElementById('flattenVal');
+    const inflateSlider = document.getElementById('inflateSlider');
+    const inflateVal = document.getElementById('inflateVal');
     const hpSlider = document.getElementById('hpSlider');
     const hpVal = document.getElementById('hpVal');
     const heightSlider = document.getElementById('heightSlider');
     const heightVal = document.getElementById('heightVal');
     const coinMaskCheck = document.getElementById('coinMaskCheck');
     const invertCheck = document.getElementById('invertCheck');
+    const removeShadowsCheck = document.getElementById('removeShadowsCheck');
     const status = document.getElementById('status');
     const origImg = document.getElementById('origImg');
     const baseImg = document.getElementById('baseImg');
@@ -331,29 +345,32 @@
       }
     };
 
-    radiusSlider.oninput = () => { radiusVal.innerText = radiusSlider.value; };
+    flattenSlider.oninput = () => { flattenVal.innerText = flattenSlider.value; };
+    inflateSlider.oninput = () => { inflateVal.innerText = inflateSlider.value; };
     hpSlider.oninput = () => { hpVal.innerText = hpSlider.value; };
     heightSlider.oninput = () => { heightVal.innerText = heightSlider.value; update3DMeshes(); };
 
-    radiusSlider.onchange = hpSlider.onchange = coinMaskCheck.onchange = invertCheck.onchange = () => {
+    useTilingCheck.onchange = flattenSlider.onchange = inflateSlider.onchange = hpSlider.onchange = coinMaskCheck.onchange = invertCheck.onchange = removeShadowsCheck.onchange = () => {
       if (currentFile) processImage();
     };
 
     async function processImage() {
-      status.innerText = "⚡ Computing Base Depth & High-Pass Filter Composite...";
+      status.innerText = "⚡ Computing Multi-Scale Depth... (This may take longer if AI Shadow Removal is ON)";
       const formData = new FormData();
       formData.append("image", currentFile);
-      formData.append("hpRadius", radiusSlider.value);
+      formData.append("useTiling", useTilingCheck.checked);
       formData.append("hpStrength", hpSlider.value);
+      formData.append("reliefFlatten", flattenSlider.value);
+      formData.append("bodyInflation", inflateSlider.value);
       formData.append("coinMask", coinMaskCheck.checked);
       formData.append("invert", invertCheck.checked);
+      formData.append("removeShadows", removeShadowsCheck.checked);
 
       try {
         const res = await fetch("/api/process", { method: "POST", body: formData });
         const data = await res.json();
         if (data.error) throw data.error;
 
-        // Row 1 Previews
         baseImg.src = data.basePreview;
         baseImg.style.display = 'block';
         document.getElementById('basePlaceholder').style.display = 'none';
@@ -368,14 +385,13 @@
 
         btnPng.style.display = 'inline-block';
 
-        // Row 2 3D Renders
         baseDepthImg.onload = () => buildBase3DMesh();
         baseDepthImg.src = data.basePreview;
 
         filterDepthImg.onload = () => buildFilter3DMesh();
         filterDepthImg.src = data.depthPreview;
 
-        status.innerText = "Done! Compare Base Render vs Filter Render below.";
+        status.innerText = "Done! Clean Multi-Scale 16-Bit Heightmap ready for ZBrush & Sculptok.";
       } catch (err) {
         status.innerText = "Error: " + err;
       }
@@ -386,7 +402,6 @@
     }
 
     function init3DViewports() {
-      // 1. Base 3D Viewport
       const containerBase = document.getElementById('viewportBase');
       sceneBase = new THREE.Scene();
       cameraBase = new THREE.PerspectiveCamera(45, containerBase.clientWidth / containerBase.clientHeight, 0.1, 1000);
@@ -399,7 +414,6 @@
       controlsBase = new THREE.OrbitControls(cameraBase, rendererBase.domElement);
       controlsBase.enableDamping = true;
 
-      // 2. Filter 3D Viewport
       const containerFilter = document.getElementById('viewportFilter');
       sceneFilter = new THREE.Scene();
       cameraFilter = new THREE.PerspectiveCamera(45, containerFilter.clientWidth / containerFilter.clientHeight, 0.1, 1000);
@@ -412,7 +426,6 @@
       controlsFilter = new THREE.OrbitControls(cameraFilter, rendererFilter.domElement);
       controlsFilter.enableDamping = true;
 
-      // Synchronize Cameras
       controlsBase.addEventListener('change', () => {
         if (!isSyncingCamera) {
           isSyncingCamera = true;
@@ -433,7 +446,6 @@
         }
       });
 
-      // Lighting for both scenes
       [sceneBase, sceneFilter].forEach(s => {
         const l1 = new THREE.DirectionalLight(0xffffff, 1.4);
         l1.position.set(1.5, 1.5, 2.5);

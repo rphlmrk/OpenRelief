@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"math"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -40,7 +43,7 @@ func main() {
 	dllPath := "onnxruntime.dll"
 	modelPath := "model.onnx"
 
-	fmt.Println("🪙 Starting OpenRelief Studio (Dual 3D View & High-Pass Engine)...")
+	fmt.Println("🪙 Starting OpenRelief Studio (Tiled Depth & Multi-Scale Engine)...")
 	eng, err := initEngine(dllPath, modelPath)
 	if err != nil {
 		fmt.Printf("Initialization Error: %v\n", err)
@@ -68,7 +71,7 @@ func main() {
 
 	w := webview.New(false)
 	defer w.Destroy()
-	w.SetTitle("OpenRelief Studio - Base vs Filtered 3D Relief Studio")
+	w.SetTitle("OpenRelief Studio - Tiled Multi-Scale Depth Studio")
 	w.SetSize(1380, 920, webview.HintNone)
 	w.Navigate(appURL)
 	w.Run()
@@ -110,6 +113,79 @@ func initEngine(dllPath, modelPath string) (*Engine, error) {
 	}, nil
 }
 
+// Helper: Run inference on a single image patch
+func runInference(img image.Image) [][]float64 {
+	resized := imaging.Resize(img, ModelInputSize, ModelInputSize, imaging.Lanczos)
+	tensorData := globalEngine.inputTensor.GetData()
+
+	mean := []float32{0.485, 0.456, 0.406}
+	std := []float32{0.229, 0.224, 0.225}
+
+	for y := 0; y < ModelInputSize; y++ {
+		for x := 0; x < ModelInputSize; x++ {
+			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+			tensorData[0*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
+			tensorData[1*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
+			tensorData[2*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
+		}
+	}
+
+	if err := globalEngine.session.Run(); err != nil {
+		return nil
+	}
+
+	rawDepth := globalEngine.outputTensor.GetData()
+	minVal, maxVal := float32(math.MaxFloat32), float32(-math.MaxFloat32)
+	for _, v := range rawDepth {
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+
+	diff := float64(maxVal - minVal)
+	if diff == 0 {
+		diff = 1.0
+	}
+
+	out := make([][]float64, ModelInputSize)
+	for y := 0; y < ModelInputSize; y++ {
+		out[y] = make([]float64, ModelInputSize)
+		for x := 0; x < ModelInputSize; x++ {
+			val := float64(rawDepth[y*ModelInputSize+x]-minVal) / diff
+			out[y][x] = val
+		}
+	}
+	return out
+}
+
+// Calculate mean & standard deviation of a region
+func calcStats(data [][]float64, startX, startY, w, h int) (mean, std float64) {
+	var sum float64
+	count := float64(w * h)
+	for y := startY; y < startY+h; y++ {
+		for x := startX; x < startX+w; x++ {
+			sum += data[y][x]
+		}
+	}
+	mean = sum / count
+
+	var sumSq float64
+	for y := startY; y < startY+h; y++ {
+		for x := startX; x < startX+w; x++ {
+			d := data[y][x] - mean
+			sumSq += d * d
+		}
+	}
+	std = math.Sqrt(sumSq / count)
+	if std < 1e-5 {
+		std = 1.0
+	}
+	return mean, std
+}
+
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -135,67 +211,178 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	hpRadius, _ := strconv.ParseFloat(r.FormValue("hpRadius"), 64)
-	if hpRadius <= 0 {
-		hpRadius = 3.5
-	}
 	hpStrength, _ := strconv.ParseFloat(r.FormValue("hpStrength"), 64)
+	reliefFlatten, _ := strconv.ParseFloat(r.FormValue("reliefFlatten"), 64)
+	bodyInflation, _ := strconv.ParseFloat(r.FormValue("bodyInflation"), 64)
+	useTiling := r.FormValue("useTiling") == "true"
 	isCoinMask := r.FormValue("coinMask") == "true"
 	isInvert := r.FormValue("invert") == "true"
+	removeShadows := r.FormValue("removeShadows") == "true" // New Parameter
 
-	srcImg, err := imaging.Decode(file)
-	if err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode image: " + err.Error()})
-		return
+	var srcImg image.Image
+
+	// --- NEW: Call Python Server if Remove Shadows is checked ---
+	if removeShadows {
+		fmt.Println("Sending image to Python server for Shadow Removal...")
+
+		// Copy uploaded file to a buffer
+		var reqBody bytes.Buffer
+		multipartWriter := multipart.NewWriter(&reqBody)
+		fileWriter, _ := multipartWriter.CreateFormFile("image", "upload.png")
+		file.Seek(0, 0)
+		io.Copy(fileWriter, file)
+		multipartWriter.Close()
+
+		// Send to Python Flask server on port 5000
+		resp, err := http.Post("http://127.0.0.1:5000/delight", multipartWriter.FormDataContentType(), &reqBody)
+		if err != nil || resp.StatusCode != 200 {
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to connect to Python Delighting Server. Is it running?"})
+			return
+		}
+		defer resp.Body.Close()
+
+		// Decode the returned shadow-free image
+		srcImg, err = imaging.Decode(resp.Body)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode Python response."})
+			return
+		}
+		fmt.Println("Shadow removal complete! Continuing with Depth processing...")
+	} else {
+		// Normal flow: just decode the uploaded file directly
+		file.Seek(0, 0)
+		srcImg, err = imaging.Decode(file)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode image: " + err.Error()})
+			return
+		}
 	}
 
 	origW, origH := srcImg.Bounds().Dx(), srcImg.Bounds().Dy()
 
-	// 1. AI BASE DEPTH MAP
-	resized := imaging.Resize(srcImg, ModelInputSize, ModelInputSize, imaging.Lanczos)
-	tensorData := globalEngine.inputTensor.GetData()
-
-	mean := []float32{0.485, 0.456, 0.406}
-	std := []float32{0.229, 0.224, 0.225}
-
-	for y := 0; y < ModelInputSize; y++ {
-		for x := 0; x < ModelInputSize; x++ {
-			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
-			tensorData[0*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
-			tensorData[1*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
-			tensorData[2*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
-		}
-	}
-
-	if err := globalEngine.session.Run(); err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": "ONNX Model error: " + err.Error()})
+	// =========================================================================
+	// 1. GLOBAL BASE DEPTH INFERENCE
+	// =========================================================================
+	baseRaw := runInference(srcImg)
+	if baseRaw == nil {
+		json.NewEncoder(w).Encode(map[string]string{"error": "Inference failed"})
 		return
 	}
 
-	rawDepth := globalEngine.outputTensor.GetData()
-	minVal, maxVal := float32(math.MaxFloat32), float32(-math.MaxFloat32)
-	for _, v := range rawDepth {
-		if v < minVal {
-			minVal = v
-		}
-		if v > maxVal {
-			maxVal = v
-		}
-	}
-
-	depth518 := image.NewGray16(image.Rect(0, 0, ModelInputSize, ModelInputSize))
-	for y := 0; y < ModelInputSize; y++ {
-		for x := 0; x < ModelInputSize; x++ {
-			val := (rawDepth[y*ModelInputSize+x] - minVal) / (maxVal - minVal)
-			depth518.SetGray16(x, y, color.Gray16{Y: uint16(val * 65535.0)})
+	// Rescale global depth to original dimensions
+	baseDepth := make([][]float64, origH)
+	for y := 0; y < origH; y++ {
+		baseDepth[y] = make([]float64, origW)
+		srcY := int(float64(y) / float64(origH) * float64(ModelInputSize-1))
+		for x := 0; x < origW; x++ {
+			srcX := int(float64(x) / float64(origW) * float64(ModelInputSize-1))
+			baseDepth[y][x] = baseRaw[srcY][srcX]
 		}
 	}
 
-	layer1_DepthMap := imaging.Resize(depth518, origW, origH, imaging.Lanczos)
+	// =========================================================================
+	// 2. HIERARCHICAL 2x2 OVERLAPPING TILING ENGINE (BillFSmith Method)
+	// =========================================================================
+	compiledTiles := make([][]float64, origH)
+	tileWeights := make([][]float64, origH)
+	for y := 0; y < origH; y++ {
+		compiledTiles[y] = make([]float64, origW)
+		tileWeights[y] = make([]float64, origW)
+	}
 
-	// 2. HIGH PASS TOP LAYER (From Original Image)
-	origGray := imaging.Grayscale(srcImg)
-	origBlurred := imaging.Blur(origGray, hpRadius)
+	if useTiling {
+		numX, numY := 2, 2
+		tileW := origW / numX
+		tileH := origH / numY
+
+		xCoords := []int{0, origW - tileW}
+		if numX > 1 {
+			xCoords = append(xCoords, tileW/2)
+		}
+		yCoords := []int{0, origH - tileH}
+		if numY > 1 {
+			yCoords = append(yCoords, tileH/2)
+		}
+
+		for _, ty := range yCoords {
+			for _, tx := range xCoords {
+				tileRect := image.Rect(tx, ty, tx+tileW, ty+tileH)
+				tileSubImg := imaging.Crop(srcImg, tileRect)
+
+				tileRaw := runInference(tileSubImg)
+				if tileRaw == nil {
+					continue
+				}
+
+				// Local statistics
+				meanLow, stdLow := calcStats(baseDepth, tx, ty, tileW, tileH)
+				meanTile, stdTile := calcStats(tileRaw, 0, 0, ModelInputSize, ModelInputSize)
+
+				for y := 0; y < tileH; y++ {
+					imgY := ty + y
+					if imgY >= origH {
+						continue
+					}
+					srcY := int(float64(y) / float64(tileH) * float64(ModelInputSize-1))
+
+					// 2D Cosine-squared windowing
+					yVal := 0.998 * math.Pow(math.Cos((math.Abs(float64(tileH)/2.0-float64(y))/float64(tileH))*math.Pi), 2)
+					if ty == 0 && y < tileH/2 {
+						yVal = 0.998
+					} else if ty == origH-tileH && y > tileH/2 {
+						yVal = 0.998
+					}
+
+					for x := 0; x < tileW; x++ {
+						imgX := tx + x
+						if imgX >= origW {
+							continue
+						}
+						srcX := int(float64(x) / float64(tileW) * float64(ModelInputSize-1))
+
+						xVal := 0.998 * math.Pow(math.Cos((math.Abs(float64(tileW)/2.0-float64(x))/float64(tileW))*math.Pi), 2)
+						if tx == 0 && x < tileW/2 {
+							xVal = 0.998
+						} else if tx == origW-tileW && x > tileW/2 {
+							xVal = 0.998
+						}
+
+						weight := xVal * yVal
+						rawVal := tileRaw[srcY][srcX]
+
+						// Scale tile depth to local base depth mean & stddev
+						scaledDepth := meanLow + stdLow*((rawVal-meanTile)/stdTile)
+
+						compiledTiles[imgY][imgX] += weight * scaledDepth
+						tileWeights[imgY][imgX] += weight
+					}
+				}
+			}
+		}
+
+		// Normalize tile accumulation
+		for y := 0; y < origH; y++ {
+			for x := 0; x < origW; x++ {
+				if tileWeights[y][x] > 0 {
+					compiledTiles[y][x] /= tileWeights[y][x]
+				} else {
+					compiledTiles[y][x] = baseDepth[y][x]
+				}
+			}
+		}
+	} else {
+		// Single-pass fallback
+		for y := 0; y < origH; y++ {
+			copy(compiledTiles[y], baseDepth[y])
+		}
+	}
+
+	// =========================================================================
+	// 3. GAUSSIAN EDGE DIFFERENCE GUIDANCE (BillFSmith Step 6)
+	// =========================================================================
+	grayImg := imaging.Grayscale(srcImg)
+	blurred20 := imaging.Blur(grayImg, 5.0)
+	blurred40 := imaging.Blur(blurred20, 8.0)
 
 	hpVisualizer := image.NewGray(image.Rect(0, 0, origW, origH))
 	baseDepthVisualizer := image.NewGray16(image.Rect(0, 0, origW, origH))
@@ -204,32 +391,43 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	centerX, centerY := float64(origW)/2.0, float64(origH)/2.0
 	radius := math.Min(centerX, centerY) - 4.0
 
-	// 3. COLOR-TO-ALPHA COMPOSITING OVER BASE DEPTH
 	for y := 0; y < origH; y++ {
 		for x := 0; x < origW; x++ {
-			dr, _, _, _ := layer1_DepthMap.At(x, y).RGBA()
-			dVal := float64(dr) / 65535.0
+			dVal := compiledTiles[y][x]
 
-			gr, _, _, _ := origGray.At(x, y).RGBA()
-			gVal := float64(gr) / 65535.0
+			// Original Grayscale & Blur pixels
+			gCol, _, _, _ := grayImg.At(x, y).RGBA()
+			gVal := float64(gCol) / 65535.0
 
-			br, _, _, _ := origBlurred.At(x, y).RGBA()
-			bVal := float64(br) / 65535.0
+			bCol20, _, _, _ := blurred20.At(x, y).RGBA()
+			bVal20 := float64(bCol20) / 65535.0
 
-			// High Pass output = 0.5 + (Original - Blurred)
-			hpVal := 0.5 + (gVal - bVal)
+			bCol40, _, _, _ := blurred40.At(x, y).RGBA()
+			bVal40 := float64(bCol40) / 65535.0
+
+			// High Pass difference
+			diff := (bVal20 - gVal)
+			diffMask := math.Min(0.999, math.Max(0.0, (bVal40-gVal)*hpStrength*4.0))
+
+			// Visualizer: 50% neutral gray preview
+			hpVal := 0.5 + (gVal - bVal20)
 			hpVisualizer.SetGray(x, y, color.Gray{Y: uint8(math.Min(255.0, math.Max(0.0, hpVal*255.0)))})
 
-			// GIMP Color-to-Alpha (#808080) Composited Over Depth
-			var blended float64
-			if hpVal >= 0.5 {
-				alpha := math.Min(1.0, 2.0*(hpVal-0.5)*hpStrength)
-				blended = dVal + alpha*(1.0-dVal)
-			} else {
-				alpha := math.Min(1.0, 2.0*(0.5-hpVal)*hpStrength)
-				blended = dVal - (alpha * dVal)
+			// 1. Perspective Flattening (Z-slope compression - no holes)
+			if reliefFlatten > 0 {
+				dVal = math.Pow(math.Max(0.0, dVal), 1.0-(reliefFlatten*0.5))
 			}
 
+			// 2. Continuous Body Inflation (Smooth anatomical puff - no holes)
+			if bodyInflation > 0 {
+				inflate := math.Sin(math.Max(0.0, math.Min(1.0, dVal)) * math.Pi * 0.5)
+				dVal = dVal*(1.0-bodyInflation*0.35) + inflate*(bodyInflation*0.35)
+			}
+
+			// 3. Merge High-Frequency Detail onto Smooth Base Depth
+			blended := diffMask*dVal + (1.0-diffMask)*(dVal+diff*hpStrength)
+
+			// Coin Masking (if selected)
 			baseVal := dVal
 			if isCoinMask {
 				dist := math.Hypot(float64(x)-centerX, float64(y)-centerY)
@@ -255,7 +453,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	id := "current"
 	globalEngine.cache[id] = result16Bit
 
-	// Thumbnails for UI
+	// Generate UI previews
 	thumbBase := imaging.Resize(baseDepthVisualizer, 450, 0, imaging.Lanczos)
 	var bufBase []byte
 	wBase := &byteWriter{buf: &bufBase}
