@@ -513,9 +513,10 @@
         <div class="slider-box">
           <label>Material:</label>
           <select id="matSelect" class="mat-select" onchange="changeMaterial()">
+            <option value="gray" selected>Matte Gray (Sculpt)</option>
             <option value="clay">ZBrush Clay</option>
-            <option value="gold">Gold Coin</option>
             <option value="silver">Silver Medallion</option>
+            <option value="gold">Gold Coin</option>
           </select>
         </div>
 
@@ -946,17 +947,19 @@
 
     function getMaterial() {
       const type = matSelect.value;
-      if (type === 'gold') return new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.85, roughness: 0.25 });
+      if (type === 'gray') return new THREE.MeshStandardMaterial({ color: 0x9e9e9e, roughness: 0.6, metalness: 0.1 });
+      if (type === 'clay') return new THREE.MeshStandardMaterial({ color: 0x995533, roughness: 0.85, metalness: 0.0 });
       if (type === 'silver') return new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.2 });
-      if (type === 'bronze') return new THREE.MeshStandardMaterial({ color: 0x8c6239, metalness: 0.7, roughness: 0.4 });
-      if (type === 'clay') return new THREE.MeshStandardMaterial({ color: 0x995533, roughness: 0.85 });
-      return new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.5 });
+      if (type === 'gold') return new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.85, roughness: 0.25 });
+      return new THREE.MeshStandardMaterial({ color: 0x9e9e9e, roughness: 0.6, metalness: 0.1 });
     }
 
-    matSelect.onchange = () => {
+    function changeMaterial() {
       if (meshBase) meshBase.material = getMaterial();
       if (meshFilter) meshFilter.material = getMaterial();
-    };
+    }
+
+    matSelect.onchange = changeMaterial;
 
     function buildBase3DMesh() {
       if (meshBase) sceneBase.remove(meshBase);
