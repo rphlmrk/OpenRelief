@@ -25,7 +25,8 @@ import (
 var htmlContent []byte
 
 const ModelInputSize = 518
-const ShadowInputSize = 512 // Most lightweight U-Nets use 512x512
+const ShadowInputSize = 512
+const NafnetInputSize = 512 // NAFNet Restoration patch size
 
 type Engine struct {
 	session      *ort.AdvancedSession
@@ -36,7 +37,8 @@ type Engine struct {
 }
 
 var globalDepthEngine *Engine
-var globalShadowEngines = make(map[string]*Engine) // Stores all shadow models
+var globalShadowEngines = make(map[string]*Engine)
+var globalNafnetEngine *Engine // NEW: NAFNet HD Restoration Engine
 
 func main() {
 	dllPath := "onnxruntime.dll"
@@ -76,6 +78,16 @@ func main() {
 		}
 	}
 
+	// Load NAFNet HD Restoration Model
+	nafnetPath := filepath.Join("models", "nafnet.onnx")
+	globalNafnetEngine, err = initEngine(nafnetPath, NafnetInputSize, NafnetInputSize, 3)
+	if err != nil {
+		fmt.Printf("Notice: Could not load nafnet.onnx (%v). HD Restoration disabled.\n", err)
+	} else {
+		defer globalNafnetEngine.session.Destroy()
+		fmt.Println("Loaded HD Restoration Model: nafnet.onnx")
+	}
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
@@ -88,6 +100,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(htmlContent)
 	})
+	mux.HandleFunc("/api/info", handleInfo) // NEW: Model Health & Status Endpoint
 	mux.HandleFunc("/api/process", handleProcess)
 	mux.HandleFunc("/api/download", handleDownload)
 
@@ -185,6 +198,49 @@ func runShadowRemoval(img image.Image, engine *Engine) image.Image {
 	}
 
 	// Resize back to original dimensions to feed into the Depth model seamlessly
+	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
+}
+
+// NEW: Native Go ONNX NAFNet HD Restoration (Deblur & Denoise)
+func runNafnetRestoration(img image.Image, engine *Engine) image.Image {
+	if engine == nil {
+		fmt.Println("NAFNet Engine not available, skipping...")
+		return img
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	resized := imaging.Resize(img, NafnetInputSize, NafnetInputSize, imaging.Lanczos)
+	tensorData := engine.inputTensor.GetData()
+
+	// Normalize image to 0.0 -> 1.0 (Standard NAFNet input)
+	for y := 0; y < NafnetInputSize; y++ {
+		for x := 0; x < NafnetInputSize; x++ {
+			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+			tensorData[0*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x] = float32(rCol>>8) / 255.0
+			tensorData[1*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x] = float32(gCol>>8) / 255.0
+			tensorData[2*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x] = float32(bCol>>8) / 255.0
+		}
+	}
+
+	if err := engine.session.Run(); err != nil {
+		fmt.Println("NAFNet ONNX Run Error:", err)
+		return img
+	}
+
+	rawOut := engine.outputTensor.GetData()
+	outImg := image.NewRGBA(image.Rect(0, 0, NafnetInputSize, NafnetInputSize))
+
+	for y := 0; y < NafnetInputSize; y++ {
+		for x := 0; x < NafnetInputSize; x++ {
+			r := uint8(math.Max(0, math.Min(255, float64(rawOut[0*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x]*255.0))))
+			g := uint8(math.Max(0, math.Min(255, float64(rawOut[1*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x]*255.0))))
+			b := uint8(math.Max(0, math.Min(255, float64(rawOut[2*NafnetInputSize*NafnetInputSize+y*NafnetInputSize+x]*255.0))))
+			outImg.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
+		}
+	}
+
 	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
 }
 
@@ -289,6 +345,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	isCoinMask := r.FormValue("coinMask") == "true"
 	isInvert := r.FormValue("invert") == "true"
 	removeShadows := r.FormValue("removeShadows") == "true"
+	hdRestoration := r.FormValue("hdRestoration") == "true" // NEW
+	targetDim := r.FormValue("targetDim")                   // NEW: "original", "2k", or "4k"
 
 	srcImg, err := imaging.Decode(file)
 	if err != nil {
@@ -297,7 +355,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var delightBase64 string
-	// --- Go-Native AI Shadow Removal with Selected Model ---
+	// --- STEP 2: Go-Native AI Shadow Removal ---
 	if removeShadows {
 		shadowModelName := r.FormValue("shadowModel")
 		if shadowModelName == "" {
@@ -307,7 +365,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 		fmt.Printf("[*] Running Shadow Removal with model: %s...\n", shadowModelName)
 		srcImg = runShadowRemoval(srcImg, selectedEngine)
-		fmt.Println("[+] Shadows removed! Passing to Depth Engine.")
+		fmt.Println("[+] Shadows removed!")
 
 		// Generate preview of the shadow-removed image
 		thumbDelight := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
@@ -317,7 +375,29 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		delightBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDelight)
 	}
 
+	// --- STEP 3 (Stage A): NAFNet HD Restoration (Deblur & Denoise) ---
+	if hdRestoration && globalNafnetEngine != nil {
+		fmt.Println("[*] Running NAFNet HD Restoration (Deblur & Clean AI noise)...")
+		srcImg = runNafnetRestoration(srcImg, globalNafnetEngine)
+		fmt.Println("[+] HD Restoration complete!")
+	}
+
+	// --- STEP 3 (Stage B): Super-Resolution Upscaling (2K / 4K) ---
 	origW, origH := srcImg.Bounds().Dx(), srcImg.Bounds().Dy()
+	if targetDim == "2k" || targetDim == "4k" {
+		maxTarget := 2048
+		if targetDim == "4k" {
+			maxTarget = 4096
+		}
+		if origW < maxTarget || origH < maxTarget {
+			scale := float64(maxTarget) / math.Max(float64(origW), float64(origH))
+			newW := int(float64(origW) * scale)
+			newH := int(float64(origH) * scale)
+			fmt.Printf("[*] Scaling artwork resolution to %s (%d × %d px)...\n", targetDim, newW, newH)
+			srcImg = imaging.Resize(srcImg, newW, newH, imaging.Lanczos)
+			origW, origH = newW, newH
+		}
+	}
 
 	globalDepthEngine.mu.Lock()
 	defer globalDepthEngine.mu.Unlock()
@@ -541,4 +621,20 @@ type byteWriter struct{ buf *[]byte }
 func (b *byteWriter) Write(p []byte) (n int, err error) {
 	*b.buf = append(*b.buf, p...)
 	return len(p), nil
+}
+
+// NEW: Reports which AI models are loaded or missing
+func handleInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	loadedShadows := []string{}
+	for name := range globalShadowEngines {
+		loadedShadows = append(loadedShadows, name)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"depthLoaded":  globalDepthEngine != nil,
+		"nafnetLoaded": globalNafnetEngine != nil,
+		"shadowModels": loadedShadows,
+	})
 }
