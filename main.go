@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -10,9 +9,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
-	"io"
 	"math"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -28,6 +25,7 @@ import (
 var htmlContent []byte
 
 const ModelInputSize = 518
+const ShadowInputSize = 512 // Most lightweight U-Nets use 512x512
 
 type Engine struct {
 	session      *ort.AdvancedSession
@@ -37,20 +35,46 @@ type Engine struct {
 	cache        map[string]*image.Gray16
 }
 
-var globalEngine *Engine
+var globalDepthEngine *Engine
+var globalShadowEngines = make(map[string]*Engine) // Stores all shadow models
 
 func main() {
 	dllPath := "onnxruntime.dll"
-	modelPath := "model.onnx"
+	depthModelPath := filepath.Join("models", "anything v2.onnx")
 
 	fmt.Println("🪙 Starting OpenRelief Studio (Tiled Depth & Multi-Scale Engine)...")
-	eng, err := initEngine(dllPath, modelPath)
+
+	// Initialize ONNX Environment
+	absDllPath, _ := filepath.Abs(dllPath)
+	ort.SetSharedLibraryPath(absDllPath)
+	err := ort.InitializeEnvironment()
 	if err != nil {
-		fmt.Printf("Initialization Error: %v\n", err)
+		fmt.Printf("ONNX Init Error: %v\n", err)
 		return
 	}
-	defer eng.session.Destroy()
-	globalEngine = eng
+	defer ort.DestroyEnvironment()
+
+	// Load Depth Engine
+	globalDepthEngine, err = initEngine(depthModelPath, ModelInputSize, ModelInputSize, 1) // Depth outputs 1 channel
+	if err != nil {
+		fmt.Printf("Depth Engine Init Error: %v\n", err)
+		return
+	}
+	defer globalDepthEngine.session.Destroy()
+
+	// Preload all 3 Shadow Removal models
+	shadowModels := []string{"docshadow_sd7k.onnx", "docshadow_jung.onnx", "docshadow_kligler.onnx"}
+	for _, modelName := range shadowModels {
+		fullPath := filepath.Join("models", modelName)
+		eng, err := initEngine(fullPath, ShadowInputSize, ShadowInputSize, 3)
+		if err != nil {
+			fmt.Printf("Notice: Could not load %s (skipped)\n", modelName)
+		} else {
+			globalShadowEngines[modelName] = eng
+			defer eng.session.Destroy()
+			fmt.Printf("Loaded Shadow Model: %s\n", modelName)
+		}
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -77,29 +101,34 @@ func main() {
 	w.Run()
 }
 
-func initEngine(dllPath, modelPath string) (*Engine, error) {
-	absDllPath, err := filepath.Abs(dllPath)
-	if err != nil {
-		return nil, err
-	}
+// Updated Init Engine to handle different output channels (1 for Depth, 3 for Shadow RGB)
+func initEngine(modelPath string, width int, height int, outChannels int) (*Engine, error) {
 	absModelPath, err := filepath.Abs(modelPath)
 	if err != nil {
 		return nil, err
 	}
 
-	ort.SetSharedLibraryPath(absDllPath)
-	if err := ort.InitializeEnvironment(); err != nil {
-		return nil, err
+	// Auto-detect the exact tensor names from the ONNX file metadata
+	inInfo, outInfo, err := ort.GetInputOutputInfo(absModelPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get metadata for %s: %w", modelPath, err)
+	}
+	inputName := inInfo[0].Name
+	outputName := outInfo[0].Name
+
+	inputShape := ort.NewShape(1, 3, int64(width), int64(height))
+	var outputShape ort.Shape
+	if outChannels == 1 {
+		outputShape = ort.NewShape(1, int64(width), int64(height))
+	} else {
+		outputShape = ort.NewShape(1, int64(outChannels), int64(width), int64(height))
 	}
 
-	inputShape := ort.NewShape(1, 3, ModelInputSize, ModelInputSize)
-	outputShape := ort.NewShape(1, ModelInputSize, ModelInputSize)
-
-	inTensor, _ := ort.NewTensor(inputShape, make([]float32, 1*3*ModelInputSize*ModelInputSize))
+	inTensor, _ := ort.NewTensor(inputShape, make([]float32, 1*3*width*height))
 	outTensor, _ := ort.NewEmptyTensor[float32](outputShape)
 
 	session, err := ort.NewAdvancedSession(absModelPath,
-		[]string{"pixel_values"}, []string{"predicted_depth"},
+		[]string{inputName}, []string{outputName},
 		[]ort.ArbitraryTensor{inTensor}, []ort.ArbitraryTensor{outTensor}, nil)
 	if err != nil {
 		return nil, err
@@ -113,10 +142,56 @@ func initEngine(dllPath, modelPath string) (*Engine, error) {
 	}, nil
 }
 
-// Helper: Run inference on a single image patch
+// NEW: Native Go ONNX Shadow Removal
+func runShadowRemoval(img image.Image, engine *Engine) image.Image {
+	if engine == nil {
+		fmt.Println("Selected Shadow Engine not available, skipping...")
+		return img
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	resized := imaging.Resize(img, ShadowInputSize, ShadowInputSize, imaging.Lanczos)
+	tensorData := engine.inputTensor.GetData()
+
+	// Normalize image to 0.0 -> 1.0 (Standard U-Net input)
+	for y := 0; y < ShadowInputSize; y++ {
+		for x := 0; x < ShadowInputSize; x++ {
+			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+			tensorData[0*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x] = float32(rCol>>8) / 255.0
+			tensorData[1*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x] = float32(gCol>>8) / 255.0
+			tensorData[2*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x] = float32(bCol>>8) / 255.0
+		}
+	}
+
+	// Run AI Inference
+	if err := engine.session.Run(); err != nil {
+		fmt.Println("Shadow ONNX Run Error:", err)
+		return img
+	}
+
+	rawOut := engine.outputTensor.GetData()
+	outImg := image.NewRGBA(image.Rect(0, 0, ShadowInputSize, ShadowInputSize))
+
+	// Reconstruct RGB Image from AI Output
+	for y := 0; y < ShadowInputSize; y++ {
+		for x := 0; x < ShadowInputSize; x++ {
+			r := uint8(math.Max(0, math.Min(255, float64(rawOut[0*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x]*255.0))))
+			g := uint8(math.Max(0, math.Min(255, float64(rawOut[1*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x]*255.0))))
+			b := uint8(math.Max(0, math.Min(255, float64(rawOut[2*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x]*255.0))))
+			outImg.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
+		}
+	}
+
+	// Resize back to original dimensions to feed into the Depth model seamlessly
+	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
+}
+
+// Helper: Run inference on a single image patch (Depth)
 func runInference(img image.Image) [][]float64 {
 	resized := imaging.Resize(img, ModelInputSize, ModelInputSize, imaging.Lanczos)
-	tensorData := globalEngine.inputTensor.GetData()
+	tensorData := globalDepthEngine.inputTensor.GetData()
 
 	mean := []float32{0.485, 0.456, 0.406}
 	std := []float32{0.229, 0.224, 0.225}
@@ -130,11 +205,11 @@ func runInference(img image.Image) [][]float64 {
 		}
 	}
 
-	if err := globalEngine.session.Run(); err != nil {
+	if err := globalDepthEngine.session.Run(); err != nil {
 		return nil
 	}
 
-	rawDepth := globalEngine.outputTensor.GetData()
+	rawDepth := globalDepthEngine.outputTensor.GetData()
 	minVal, maxVal := float32(math.MaxFloat32), float32(-math.MaxFloat32)
 	for _, v := range rawDepth {
 		if v < minVal {
@@ -161,7 +236,6 @@ func runInference(img image.Image) [][]float64 {
 	return out
 }
 
-// Calculate mean & standard deviation of a region
 func calcStats(data [][]float64, startX, startY, w, h int) (mean, std float64) {
 	var sum float64
 	count := float64(w * h)
@@ -196,9 +270,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	globalEngine.mu.Lock()
-	defer globalEngine.mu.Unlock()
-
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -217,52 +288,41 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	useTiling := r.FormValue("useTiling") == "true"
 	isCoinMask := r.FormValue("coinMask") == "true"
 	isInvert := r.FormValue("invert") == "true"
-	removeShadows := r.FormValue("removeShadows") == "true" // New Parameter
+	removeShadows := r.FormValue("removeShadows") == "true"
 
-	var srcImg image.Image
+	srcImg, err := imaging.Decode(file)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode image: " + err.Error()})
+		return
+	}
 
-	// --- NEW: Call Python Server if Remove Shadows is checked ---
+	var delightBase64 string
+	// --- Go-Native AI Shadow Removal with Selected Model ---
 	if removeShadows {
-		fmt.Println("Sending image to Python server for Shadow Removal...")
-
-		// Copy uploaded file to a buffer
-		var reqBody bytes.Buffer
-		multipartWriter := multipart.NewWriter(&reqBody)
-		fileWriter, _ := multipartWriter.CreateFormFile("image", "upload.png")
-		file.Seek(0, 0)
-		io.Copy(fileWriter, file)
-		multipartWriter.Close()
-
-		// Send to Python Flask server on port 5000
-		resp, err := http.Post("http://127.0.0.1:5000/delight", multipartWriter.FormDataContentType(), &reqBody)
-		if err != nil || resp.StatusCode != 200 {
-			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to connect to Python Delighting Server. Is it running?"})
-			return
+		shadowModelName := r.FormValue("shadowModel")
+		if shadowModelName == "" {
+			shadowModelName = "docshadow_sd7k.onnx"
 		}
-		defer resp.Body.Close()
+		selectedEngine := globalShadowEngines[shadowModelName]
 
-		// Decode the returned shadow-free image
-		srcImg, err = imaging.Decode(resp.Body)
-		if err != nil {
-			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode Python response."})
-			return
-		}
-		fmt.Println("Shadow removal complete! Continuing with Depth processing...")
-	} else {
-		// Normal flow: just decode the uploaded file directly
-		file.Seek(0, 0)
-		srcImg, err = imaging.Decode(file)
-		if err != nil {
-			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to decode image: " + err.Error()})
-			return
-		}
+		fmt.Printf("[*] Running Shadow Removal with model: %s...\n", shadowModelName)
+		srcImg = runShadowRemoval(srcImg, selectedEngine)
+		fmt.Println("[+] Shadows removed! Passing to Depth Engine.")
+
+		// Generate preview of the shadow-removed image
+		thumbDelight := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
+		var bufDelight []byte
+		wDelight := &byteWriter{buf: &bufDelight}
+		jpeg.Encode(wDelight, thumbDelight, &jpeg.Options{Quality: 85})
+		delightBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDelight)
 	}
 
 	origW, origH := srcImg.Bounds().Dx(), srcImg.Bounds().Dy()
 
-	// =========================================================================
+	globalDepthEngine.mu.Lock()
+	defer globalDepthEngine.mu.Unlock()
+
 	// 1. GLOBAL BASE DEPTH INFERENCE
-	// =========================================================================
 	baseRaw := runInference(srcImg)
 	if baseRaw == nil {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Inference failed"})
@@ -280,9 +340,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// =========================================================================
-	// 2. HIERARCHICAL 2x2 OVERLAPPING TILING ENGINE (BillFSmith Method)
-	// =========================================================================
+	// 2. HIERARCHICAL 2x2 OVERLAPPING TILING ENGINE
 	compiledTiles := make([][]float64, origH)
 	tileWeights := make([][]float64, origH)
 	for y := 0; y < origH; y++ {
@@ -314,7 +372,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				// Local statistics
 				meanLow, stdLow := calcStats(baseDepth, tx, ty, tileW, tileH)
 				meanTile, stdTile := calcStats(tileRaw, 0, 0, ModelInputSize, ModelInputSize)
 
@@ -325,7 +382,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 					}
 					srcY := int(float64(y) / float64(tileH) * float64(ModelInputSize-1))
 
-					// 2D Cosine-squared windowing
 					yVal := 0.998 * math.Pow(math.Cos((math.Abs(float64(tileH)/2.0-float64(y))/float64(tileH))*math.Pi), 2)
 					if ty == 0 && y < tileH/2 {
 						yVal = 0.998
@@ -350,9 +406,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 						weight := xVal * yVal
 						rawVal := tileRaw[srcY][srcX]
 
-						// Scale tile depth to local base depth mean & stddev
 						scaledDepth := meanLow + stdLow*((rawVal-meanTile)/stdTile)
-
 						compiledTiles[imgY][imgX] += weight * scaledDepth
 						tileWeights[imgY][imgX] += weight
 					}
@@ -360,7 +414,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Normalize tile accumulation
 		for y := 0; y < origH; y++ {
 			for x := 0; x < origW; x++ {
 				if tileWeights[y][x] > 0 {
@@ -371,15 +424,12 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Single-pass fallback
 		for y := 0; y < origH; y++ {
 			copy(compiledTiles[y], baseDepth[y])
 		}
 	}
 
-	// =========================================================================
-	// 3. GAUSSIAN EDGE DIFFERENCE GUIDANCE (BillFSmith Step 6)
-	// =========================================================================
+	// 3. GAUSSIAN EDGE DIFFERENCE GUIDANCE
 	grayImg := imaging.Grayscale(srcImg)
 	blurred20 := imaging.Blur(grayImg, 5.0)
 	blurred40 := imaging.Blur(blurred20, 8.0)
@@ -395,7 +445,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		for x := 0; x < origW; x++ {
 			dVal := compiledTiles[y][x]
 
-			// Original Grayscale & Blur pixels
 			gCol, _, _, _ := grayImg.At(x, y).RGBA()
 			gVal := float64(gCol) / 65535.0
 
@@ -405,29 +454,23 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			bCol40, _, _, _ := blurred40.At(x, y).RGBA()
 			bVal40 := float64(bCol40) / 65535.0
 
-			// High Pass difference
 			diff := (bVal20 - gVal)
 			diffMask := math.Min(0.999, math.Max(0.0, (bVal40-gVal)*hpStrength*4.0))
 
-			// Visualizer: 50% neutral gray preview
 			hpVal := 0.5 + (gVal - bVal20)
 			hpVisualizer.SetGray(x, y, color.Gray{Y: uint8(math.Min(255.0, math.Max(0.0, hpVal*255.0)))})
 
-			// 1. Perspective Flattening (Z-slope compression - no holes)
 			if reliefFlatten > 0 {
 				dVal = math.Pow(math.Max(0.0, dVal), 1.0-(reliefFlatten*0.5))
 			}
 
-			// 2. Continuous Body Inflation (Smooth anatomical puff - no holes)
 			if bodyInflation > 0 {
 				inflate := math.Sin(math.Max(0.0, math.Min(1.0, dVal)) * math.Pi * 0.5)
 				dVal = dVal*(1.0-bodyInflation*0.35) + inflate*(bodyInflation*0.35)
 			}
 
-			// 3. Merge High-Frequency Detail onto Smooth Base Depth
 			blended := diffMask*dVal + (1.0-diffMask)*(dVal+diff*hpStrength)
 
-			// Coin Masking (if selected)
 			baseVal := dVal
 			if isCoinMask {
 				dist := math.Hypot(float64(x)-centerX, float64(y)-centerY)
@@ -451,9 +494,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := "current"
-	globalEngine.cache[id] = result16Bit
+	globalDepthEngine.cache[id] = result16Bit
 
-	// Generate UI previews
 	thumbBase := imaging.Resize(baseDepthVisualizer, 450, 0, imaging.Lanczos)
 	var bufBase []byte
 	wBase := &byteWriter{buf: &bufBase}
@@ -470,19 +512,20 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	jpeg.Encode(wDepth, thumbDepth, &jpeg.Options{Quality: 85})
 
 	json.NewEncoder(w).Encode(map[string]string{
-		"id":           id,
-		"basePreview":  "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBase),
-		"hpPreview":    "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufHP),
-		"depthPreview": "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDepth),
+		"id":             id,
+		"delightPreview": delightBase64,
+		"basePreview":    "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBase),
+		"hpPreview":      "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufHP),
+		"depthPreview":   "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDepth),
 	})
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
-	globalEngine.mu.Lock()
-	defer globalEngine.mu.Unlock()
+	globalDepthEngine.mu.Lock()
+	defer globalDepthEngine.mu.Unlock()
 
 	id := r.URL.Query().Get("id")
-	img, ok := globalEngine.cache[id]
+	img, ok := globalDepthEngine.cache[id]
 	if !ok {
 		http.Error(w, "Not found", 404)
 		return

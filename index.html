@@ -111,7 +111,7 @@
 
     .grid-row1 {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 10px;
       margin-bottom: 12px;
     }
@@ -254,6 +254,15 @@
         <input type="checkbox" id="removeShadowsCheck"> ✨ AI Shadow Removal
       </label>
 
+      <div class="slider-box" id="shadowModelBox" style="display:none; min-width: 140px;">
+        <label>Shadow Model:</label>
+        <select id="shadowModelSelect" class="mat-select">
+          <option value="docshadow_sd7k.onnx">SD7K (Relief/Coin)</option>
+          <option value="docshadow_jung.onnx">Jung (Synthetic)</option>
+          <option value="docshadow_kligler.onnx">Kligler (Paper/Curves)</option>
+        </select>
+      </div>
+
       <button id="btnPng" class="btn-green" style="display:none" onclick="downloadPNG()">💾 Download 16-Bit PNG (ZBrush
         / Sculptok)</button>
     </div>
@@ -266,16 +275,20 @@
         <div class="img-box-2d"><img id="origImg" style="display:none"><span id="origPlaceholder">No image</span></div>
       </div>
       <div class="card">
-        <h4>2. Base Depth Map</h4>
+        <h4>2. Delighted Image</h4>
+        <div class="img-box-2d"><img id="delightImg" style="display:none"><span id="delightPlaceholder">Shadows Active?</span></div>
+      </div>
+      <div class="card">
+        <h4>3. Base Depth Map</h4>
         <div class="img-box-2d"><img id="baseImg" style="display:none"><span id="basePlaceholder">Waiting...</span>
         </div>
       </div>
       <div class="card">
-        <h4>3. High-Pass Filter Layer</h4>
+        <h4>4. High-Pass Layer</h4>
         <div class="img-box-2d"><img id="hpImg" style="display:none"><span id="hpPlaceholder">Waiting...</span></div>
       </div>
       <div class="card">
-        <h4>4. Master 16-Bit Depth</h4>
+        <h4>5. Master 16-Bit Depth</h4>
         <div class="img-box-2d"><img id="depthImg" style="display:none"><span id="depthPlaceholder">Waiting...</span>
         </div>
       </div>
@@ -325,8 +338,11 @@
     const coinMaskCheck = document.getElementById('coinMaskCheck');
     const invertCheck = document.getElementById('invertCheck');
     const removeShadowsCheck = document.getElementById('removeShadowsCheck');
+    const shadowModelSelect = document.getElementById('shadowModelSelect');
+    const shadowModelBox = document.getElementById('shadowModelBox');
     const status = document.getElementById('status');
     const origImg = document.getElementById('origImg');
+    const delightImg = document.getElementById('delightImg');
     const baseImg = document.getElementById('baseImg');
     const hpImg = document.getElementById('hpImg');
     const depthImg = document.getElementById('depthImg');
@@ -350,7 +366,16 @@
     hpSlider.oninput = () => { hpVal.innerText = hpSlider.value; };
     heightSlider.oninput = () => { heightVal.innerText = heightSlider.value; update3DMeshes(); };
 
-    useTilingCheck.onchange = flattenSlider.onchange = inflateSlider.onchange = hpSlider.onchange = coinMaskCheck.onchange = invertCheck.onchange = removeShadowsCheck.onchange = () => {
+    removeShadowsCheck.onchange = () => {
+      shadowModelBox.style.display = removeShadowsCheck.checked ? 'flex' : 'none';
+      if (currentFile) processImage();
+    };
+
+    shadowModelSelect.onchange = () => {
+      if (currentFile) processImage();
+    };
+
+    useTilingCheck.onchange = flattenSlider.onchange = inflateSlider.onchange = hpSlider.onchange = coinMaskCheck.onchange = invertCheck.onchange = () => {
       if (currentFile) processImage();
     };
 
@@ -365,11 +390,21 @@
       formData.append("coinMask", coinMaskCheck.checked);
       formData.append("invert", invertCheck.checked);
       formData.append("removeShadows", removeShadowsCheck.checked);
+      formData.append("shadowModel", shadowModelSelect.value);
 
       try {
         const res = await fetch("/api/process", { method: "POST", body: formData });
         const data = await res.json();
         if (data.error) throw data.error;
+
+        if (data.delightPreview) {
+          delightImg.src = data.delightPreview;
+          delightImg.style.display = 'block';
+          document.getElementById('delightPlaceholder').style.display = 'none';
+        } else {
+          delightImg.style.display = 'none';
+          document.getElementById('delightPlaceholder').style.display = 'block';
+        }
 
         baseImg.src = data.basePreview;
         baseImg.style.display = 'block';

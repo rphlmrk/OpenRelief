@@ -19,3 +19,4 @@ depth_preview.png
 .DS_Store
 Thumbs.db
 model.onnx_data
+models/anything v2.onnx_data
