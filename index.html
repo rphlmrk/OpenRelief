@@ -623,9 +623,17 @@
         </div>
       </div>
     </div>
+  <!-- FULLSCREEN HD LIGHTBOX MODAL WITH ZOOM & PAN -->
+  <div id="lightboxModal">
+    <div id="lightboxHeader">
+      <span id="lightboxTitle">HD Preview</span>
+      <span id="lightboxHint">🔍 Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit</span>
+    </div>
+    <span id="lightboxClose" onclick="closeLightbox()">&times;</span>
+    <div id="lightboxViewport">
+      <img id="lightboxImg" src="">
+    </div>
   </div>
-
-
 
   <script>
     let currentFile = null;
@@ -1001,95 +1009,121 @@
       if (meshFilter) buildFilter3DMesh();
     }
 
+    // --- ROBUST INTERACTIVE HD LIGHTBOX ENGINE ---
     let currentScale = 1.0;
     let panX = 0, panY = 0;
     let isPanning = false;
     let startX = 0, startY = 0;
-    const lbModal = document.getElementById('lightboxModal');
-    const lbImg = document.getElementById('lightboxImg');
-    const lbViewport = document.getElementById('lightboxViewport');
 
-    function updateLightboxTransform() {
-      lbImg.style.transform = `translate(${panX}px, ${panY}px) scale(${currentScale})`;
-      lbImg.style.cursor = currentScale > 1.0 ? 'zoom-out' : 'zoom-in';
-      document.getElementById('lightboxHint').innerText = `🔍 Zoom: ${(currentScale * 100).toFixed(0)}% | Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit`;
+    function getLbElements() {
+      return {
+        modal: document.getElementById('lightboxModal'),
+        img: document.getElementById('lightboxImg'),
+        viewport: document.getElementById('lightboxViewport'),
+        title: document.getElementById('lightboxTitle'),
+        hint: document.getElementById('lightboxHint')
+      };
     }
 
-    function openLightbox(imgSrc, title) {
-      if (!imgSrc) return;
-      lbImg.src = imgSrc;
-      document.getElementById('lightboxTitle').innerText = title;
+    function updateLightboxTransform() {
+      const el = getLbElements();
+      if (!el.img) return;
+      el.img.style.transform = `translate(${panX}px, ${panY}px) scale(${currentScale})`;
+      el.img.style.cursor = currentScale > 1.0 ? 'grab' : 'zoom-in';
+      if (el.hint) {
+        el.hint.innerText = `🔍 Zoom: ${(currentScale * 100).toFixed(0)}% | Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit`;
+      }
+    }
+
+    function openLightbox(imgElement, titleText) {
+      if (!imgElement || !imgElement.src || imgElement.style.display === 'none') {
+        return; // Don't open if image isn't loaded yet
+      }
+      const el = getLbElements();
+      if (!el.modal || !el.img) return;
+
+      el.img.src = imgElement.src;
+      if (el.title) el.title.innerText = titleText;
+      
       currentScale = 1.0;
       panX = 0;
       panY = 0;
       updateLightboxTransform();
-      lbModal.style.display = 'flex';
+      el.modal.style.display = 'flex';
     }
 
     function closeLightbox() {
-      lbModal.style.display = 'none';
+      const el = getLbElements();
+      if (el.modal) el.modal.style.display = 'none';
       currentScale = 1.0;
       panX = 0;
       panY = 0;
     }
 
-    lbModal.onclick = (e) => {
-      if (e.target === lbModal) closeLightbox();
-    };
-
-    lbImg.onclick = (e) => {
-      e.stopPropagation();
-      if (e.ctrlKey) {
-        currentScale = Math.max(1.0, currentScale - 0.5);
-      } else {
-        currentScale = Math.min(5.0, currentScale + 0.5);
+    // Attach Click-to-Zoom & Drag events
+    document.addEventListener('DOMContentLoaded', () => {
+      const el = getLbElements();
+      
+      if (el.modal) {
+        // Clicking backdrop closes modal
+        el.modal.onclick = (e) => {
+          if (e.target === el.modal || e.target === el.viewport) closeLightbox();
+        };
       }
-      if (currentScale === 1.0) { panX = 0; panY = 0; }
-      updateLightboxTransform();
-    };
 
-    lbViewport.onmousedown = (e) => {
-      if (currentScale > 1.0) {
-        isPanning = true;
-        startX = e.clientX - panX;
-        startY = e.clientY - panY;
+      if (el.img) {
+        // Image Click: Normal Click -> Zoom In (+0.5x), Ctrl+Click -> Zoom Out (-0.5x)
+        el.img.onclick = (e) => {
+          e.stopPropagation();
+          if (e.ctrlKey) {
+            currentScale = Math.max(1.0, currentScale - 0.5);
+          } else {
+            currentScale = Math.min(6.0, currentScale + 0.5);
+          }
+          if (currentScale === 1.0) { panX = 0; panY = 0; }
+          updateLightboxTransform();
+        };
+
+        // Click & Drag to Pan
+        el.img.onmousedown = (e) => {
+          if (currentScale > 1.0) {
+            isPanning = true;
+            startX = e.clientX - panX;
+            startY = e.clientY - panY;
+            el.img.style.cursor = 'grabbing';
+          }
+        };
       }
-    };
+    });
 
-    window.onmousemove = (e) => {
+    window.addEventListener('mousemove', (e) => {
       if (isPanning) {
         panX = e.clientX - startX;
         panY = e.clientY - startY;
         updateLightboxTransform();
       }
-    };
-
-    window.onmouseup = () => { isPanning = false; };
-
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && lbModal.style.display === 'flex') closeLightbox();
     });
 
-    origImg.parentElement.onclick = () => openLightbox(origImg.src, "1. Original Input Image");
-    delightImg.parentElement.onclick = () => openLightbox(delightImg.src, "2. Shadow-Removed (Delighted) Image");
-    bgImg.parentElement.onclick = () => openLightbox(bgImg.src, "3. U-2-Net Cutout (No Background)");
-    upscaleImg.parentElement.onclick = () => openLightbox(upscaleImg.src, `4. HD Restored & Upscaled (${dimensionSelect.value.toUpperCase()})`);
-    baseImg.parentElement.onclick = () => openLightbox(baseImg.src, "5. Global Depth Map");
-    hpImg.parentElement.onclick = () => openLightbox(hpImg.src, "6. High-Pass Filter Layer");
-    depthImg.parentElement.onclick = () => openLightbox(depthImg.src, "7. Master 16-Bit Depth Map");
-  </script>
+    window.addEventListener('mouseup', () => {
+      isPanning = false;
+      const el = getLbElements();
+      if (el.img) el.img.style.cursor = currentScale > 1.0 ? 'grab' : 'zoom-in';
+    });
 
-  <!-- FULLSCREEN HD LIGHTBOX MODAL WITH ZOOM & PAN -->
-  <div id="lightboxModal">
-    <div id="lightboxHeader">
-      <span id="lightboxTitle">HD Preview</span>
-      <span id="lightboxHint">🔍 Click: Zoom In | Ctrl+Click: Zoom Out | Drag: Pan | [×] to Exit</span>
-    </div>
-    <span id="lightboxClose" onclick="closeLightbox()">&times;</span>
-    <div id="lightboxViewport" id="lightboxViewport">
-      <img id="lightboxImg" src="">
-    </div>
-  </div>
+    // Keyboard ESC shortcut to close
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeLightbox();
+    });
+
+    // Bind cards to open the high-res lightbox
+    document.getElementById('origImg').closest('.card').onclick = () => openLightbox(origImg, "1. Original Input Image");
+    document.getElementById('delightImg').closest('.card').onclick = () => openLightbox(delightImg, "2. Shadow-Removed (Delighted) Image");
+    document.getElementById('bgImg').closest('.card').onclick = () => openLightbox(bgImg, "3. U-2-Net Cutout (No Background)");
+    document.getElementById('upscaleImg').closest('.card').onclick = () => openLightbox(upscaleImg, `4. HD Restored & Upscaled (${dimensionSelect.value.toUpperCase()})`);
+    document.getElementById('baseImg').closest('.card').onclick = () => openLightbox(baseImg, "5. Global Depth Map");
+    document.getElementById('hpImg').closest('.card').onclick = () => openLightbox(hpImg, "6. High-Pass Filter Layer");
+    document.getElementById('depthImg').closest('.card').onclick = () => openLightbox(depthImg, "7. Master 16-Bit Depth Map");
+  </script>
 </body>
 
 </html>
