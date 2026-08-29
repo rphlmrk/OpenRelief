@@ -531,7 +531,7 @@
         <div class="group-title">Models Status</div>
         <div class="model-health-list">
           <div class="health-tag">
-            <span>Depth Anything V2:</span>
+            <span>Depth Anything V3:</span>
             <span id="tagDepth" class="tag-ok">Checking...</span>
           </div>
           <div class="health-tag">
@@ -698,12 +698,13 @@
       try {
         const res = await fetch("/api/info");
         const data = await res.json();
+        // UPDATED: Depth Anything V3 Tag Check
         const tagDepth = document.getElementById("tagDepth");
         if (data.depthLoaded) {
-          tagDepth.innerText = "Active (anything v2)";
+          tagDepth.innerText = "Active (anything v3)";
           tagDepth.className = "tag-ok";
         } else {
-          tagDepth.innerText = "⚠️ Missing (anything v2.onnx)";
+          tagDepth.innerText = "⚠️ Missing (anything v3.onnx)";
           tagDepth.className = "tag-missing";
         }
         const tagU2net = document.getElementById("tagU2net");

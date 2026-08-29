@@ -44,7 +44,8 @@ var globalBgrEngine *Engine // NEW: U-2-Net Background Removal Engine
 
 func main() {
 	dllPath := "onnxruntime.dll"
-	depthModelPath := filepath.Join("models", "anything v2.onnx")
+	// UPDATED: Now targeting Depth Anything V3
+	depthModelPath := filepath.Join("models", "anything v3.onnx")
 
 	fmt.Println("🪙 Starting OpenRelief Studio (Tiled Depth & Multi-Scale Engine)...")
 
