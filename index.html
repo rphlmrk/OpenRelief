@@ -469,6 +469,15 @@
       <div class="control-group">
         <div class="group-title">Relief Geometry &amp; Tiling</div>
 
+        <div class="slider-box">
+          <label>Depth Anything 3 Model:</label>
+          <select id="depthModelSelect" class="mat-select">
+            <option value="da3_small.onnx">DA3 Small (Fast)</option>
+            <option value="da3_base.onnx">DA3 Base (High Quality)</option>
+            <option value="da3_metric_large.onnx">DA3 Metric Large (Physical)</option>
+          </select>
+        </div>
+
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <label class="checkbox-box" title="Runs overlapping hierarchical tile inference">
             <input type="checkbox" id="useTilingCheck" checked> Multi-Scale Tiling
@@ -694,17 +703,32 @@
       update3DViewportsSize();
     };
 
+    const depthModelSelect = document.getElementById('depthModelSelect');
+
+    depthModelSelect.onchange = () => {
+      if (currentFile) processImage();
+    };
+
     async function checkModelHealth() {
       try {
         const res = await fetch("/api/info");
         const data = await res.json();
-        // UPDATED: Depth Anything V3 Tag Check
         const tagDepth = document.getElementById("tagDepth");
-        if (data.depthLoaded) {
-          tagDepth.innerText = "Active (anything v3)";
+        
+        if (data.da3Models && data.da3Models.length > 0) {
+          tagDepth.innerText = `${data.da3Models.length} Models Active`;
           tagDepth.className = "tag-ok";
+          
+          // Populate dropdown with only available models
+          depthModelSelect.innerHTML = "";
+          data.da3Models.forEach(m => {
+            const opt = document.createElement("option");
+            opt.value = m;
+            opt.innerText = m.replace(".onnx", "").toUpperCase();
+            depthModelSelect.appendChild(opt);
+          });
         } else {
-          tagDepth.innerText = "⚠️ Missing (anything v3.onnx)";
+          tagDepth.innerText = "⚠️ Missing (da3_*.onnx)";
           tagDepth.className = "tag-missing";
         }
         const tagU2net = document.getElementById("tagU2net");
@@ -791,6 +815,7 @@
       statusText.innerText = `⏳ Processing: [Shadows: ${removeShadowsCheck.checked ? 'ON' : 'OFF'}] + [NAFNet HD: ${hdRestorationCheck.checked ? 'ON' : 'OFF'}] + [Scale: ${dimensionSelect.value.toUpperCase()}]...`;
       const formData = new FormData();
       formData.append("image", currentFile);
+      formData.append("depthModel", depthModelSelect.value);
       formData.append("useTiling", useTilingCheck.checked);
       formData.append("tileDensity", tileDensitySelect.value);
       formData.append("hpStrength", hpSlider.value);

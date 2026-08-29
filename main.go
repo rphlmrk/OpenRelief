@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -27,25 +28,29 @@ var htmlContent []byte
 const ModelInputSize = 518
 const ShadowInputSize = 512
 const NafnetInputSize = 512
-const U2NetInputSize = 320 // U-2-Net standard resolution
+const U2NetInputSize = 320
 
 type Engine struct {
-	session      *ort.AdvancedSession
-	inputTensor  *ort.Tensor[float32]
-	outputTensor *ort.Tensor[float32]
-	mu           sync.Mutex
-	cache        map[string]*image.Gray16
+	session       *ort.AdvancedSession
+	inputTensor   *ort.Tensor[float32]
+	inputTensorU8 *ort.Tensor[uint8]
+	outputTensor  *ort.Tensor[float32]
+	isUint8       bool
+	isNHWC        bool
+	inputWidth    int
+	inputHeight   int
+	mu            sync.Mutex
+	cache         map[string]*image.Gray16
 }
 
-var globalDepthEngine *Engine
+var globalDepthEngines = make(map[string]*Engine)
+var defaultDepthModel string
 var globalShadowEngines = make(map[string]*Engine)
 var globalNafnetEngine *Engine
-var globalBgrEngine *Engine // NEW: U-2-Net Background Removal Engine
+var globalBgrEngine *Engine
 
 func main() {
 	dllPath := "onnxruntime.dll"
-	// UPDATED: Now targeting Depth Anything V3
-	depthModelPath := filepath.Join("models", "anything v3.onnx")
 
 	fmt.Println("🪙 Starting OpenRelief Studio (Tiled Depth & Multi-Scale Engine)...")
 
@@ -59,13 +64,27 @@ func main() {
 	}
 	defer ort.DestroyEnvironment()
 
-	// Load Depth Engine
-	globalDepthEngine, err = initEngine(depthModelPath, ModelInputSize, ModelInputSize, 1) // Depth outputs 1 channel
-	if err != nil {
-		fmt.Printf("Depth Engine Init Error: %v\n", err)
-		return
+	// Preload all available Depth Anything 3 (DA3) models
+	da3Models := []string{"da3_small.onnx", "da3_base.onnx", "da3_metric_large.onnx", "anything v3.onnx"}
+	for _, modelName := range da3Models {
+		fullPath := filepath.Join("models", modelName)
+		if _, statErr := os.Stat(fullPath); statErr == nil {
+			eng, err := initEngine(fullPath, ModelInputSize, ModelInputSize, 1)
+			if err != nil {
+				fmt.Printf("Notice: Could not load %s (%v, skipped)\n", modelName, err)
+			} else {
+				globalDepthEngines[modelName] = eng
+				if defaultDepthModel == "" {
+					defaultDepthModel = modelName
+				}
+				defer eng.session.Destroy()
+				fmt.Printf("Loaded DA3 Model: %s\n", modelName)
+			}
+		}
 	}
-	defer globalDepthEngine.session.Destroy()
+	if len(globalDepthEngines) == 0 {
+		fmt.Println("⚠️ Warning: No DA3 models found in 'models/' folder.")
+	}
 
 	// Preload all 3 Shadow Removal models
 	shadowModels := []string{"docshadow_sd7k.onnx", "docshadow_jung.onnx", "docshadow_kligler.onnx"}
@@ -91,11 +110,10 @@ func main() {
 		fmt.Println("Loaded HD Restoration Model: nafnet.onnx")
 	}
 
-	// Load U-2-Net Background Removal Model (u2net.onnx or u2netp.onnx)
+	// Load U-2-Net Background Removal Model
 	u2netPath := filepath.Join("models", "u2net.onnx")
 	globalBgrEngine, err = initEngine(u2netPath, U2NetInputSize, U2NetInputSize, 1)
 	if err != nil {
-		// Fallback check for u2netp.onnx
 		u2netPath = filepath.Join("models", "u2netp.onnx")
 		globalBgrEngine, err = initEngine(u2netPath, U2NetInputSize, U2NetInputSize, 1)
 	}
@@ -118,7 +136,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(htmlContent)
 	})
-	mux.HandleFunc("/api/info", handleInfo) // NEW: Model Health & Status Endpoint
+	mux.HandleFunc("/api/info", handleInfo)
 	mux.HandleFunc("/api/process", handleProcess)
 	mux.HandleFunc("/api/download", handleDownload)
 
@@ -132,7 +150,7 @@ func main() {
 	w.Run()
 }
 
-// Dynamic Init Engine that auto-detects tensor ranks (Fixes Rank 3 vs 4 mismatch)
+// Dynamic Init Engine that auto-detects uint8 vs float32 and 3D/4D/5D topologies
 func initEngine(modelPath string, width int, height int, outChannels int) (*Engine, error) {
 	absModelPath, err := filepath.Abs(modelPath)
 	if err != nil {
@@ -143,78 +161,178 @@ func initEngine(modelPath string, width int, height int, outChannels int) (*Engi
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metadata for %s: %w", modelPath, err)
 	}
+	if len(inInfo) == 0 || len(outInfo) == 0 {
+		return nil, fmt.Errorf("model has no inputs or outputs: %s", modelPath)
+	}
+
 	inputName := inInfo[0].Name
 	outputName := outInfo[0].Name
+	isUint8 := inInfo[0].DataType == ort.TensorElementDataTypeUint8
 
-	// Dynamic Shape Reconstruction
-	inShapeDims := inInfo[0].Dimensions
-	for i, d := range inShapeDims {
-		if d <= 0 {
-			if i == 0 { inShapeDims[i] = 1 }
-			if i == 1 { inShapeDims[i] = 3 }
-			if i == 2 { inShapeDims[i] = int64(height) }
-			if i == 3 { inShapeDims[i] = int64(width) }
+	// 1. Resolve Input Shapes
+	inShapeDims := make([]int64, len(inInfo[0].Dimensions))
+	copy(inShapeDims, inInfo[0].Dimensions)
+
+	modelW, modelH := width, height
+	isNHWC := false
+
+	if len(inShapeDims) == 4 {
+		if inShapeDims[3] == 3 || (inShapeDims[3] == -1 && inShapeDims[1] != 3) {
+			// NHWC: [1, H, W, 3]
+			isNHWC = true
+			for i, d := range inShapeDims {
+				if d <= 0 {
+					if i == 0 {
+						inShapeDims[i] = 1
+					}
+					if i == 1 {
+						inShapeDims[i] = int64(height)
+					}
+					if i == 2 {
+						inShapeDims[i] = int64(width)
+					}
+					if i == 3 {
+						inShapeDims[i] = 3
+					}
+				}
+			}
+			modelH = int(inShapeDims[1])
+			modelW = int(inShapeDims[2])
+		} else {
+			// NCHW: [1, 3, H, W]
+			for i, d := range inShapeDims {
+				if d <= 0 {
+					if i == 0 {
+						inShapeDims[i] = 1
+					}
+					if i == 1 {
+						inShapeDims[i] = 3
+					}
+					if i == 2 {
+						inShapeDims[i] = int64(height)
+					}
+					if i == 3 {
+						inShapeDims[i] = int64(width)
+					}
+				}
+			}
+			modelH = int(inShapeDims[2])
+			modelW = int(inShapeDims[3])
 		}
-	}
-	if len(inShapeDims) == 0 {
-		inShapeDims = []int64{1, 3, int64(width), int64(height)}
+	} else if len(inShapeDims) == 5 {
+		// DA3 Multi-View: [1, 1, 3, H, W]
+		for i, d := range inShapeDims {
+			if d <= 0 {
+				if i == 0 {
+					inShapeDims[i] = 1
+				}
+				if i == 1 {
+					inShapeDims[i] = 1
+				}
+				if i == 2 {
+					inShapeDims[i] = 3
+				}
+				if i == 3 {
+					inShapeDims[i] = int64(height)
+				}
+				if i == 4 {
+					inShapeDims[i] = int64(width)
+				}
+			}
+		}
+		modelH = int(inShapeDims[3])
+		modelW = int(inShapeDims[4])
+	} else {
+		inShapeDims = []int64{1, 3, int64(height), int64(width)}
 	}
 
-	outShapeDims := outInfo[0].Dimensions
+	// 2. Resolve Output Shapes
+	outShapeDims := make([]int64, len(outInfo[0].Dimensions))
+	copy(outShapeDims, outInfo[0].Dimensions)
+
 	for i, d := range outShapeDims {
 		if d <= 0 {
-			if i == 0 { outShapeDims[i] = 1 }
-			if i == 1 && len(outShapeDims) == 4 { outShapeDims[i] = int64(outChannels) }
-			if i == len(outShapeDims)-2 { outShapeDims[i] = int64(height) }
-			if i == len(outShapeDims)-1 { outShapeDims[i] = int64(width) }
+			if i == 0 {
+				outShapeDims[i] = 1
+			} else if i == 1 && len(outShapeDims) == 4 {
+				outShapeDims[i] = int64(outChannels)
+			} else if i == len(outShapeDims)-2 {
+				outShapeDims[i] = int64(modelH)
+			} else if i == len(outShapeDims)-1 {
+				outShapeDims[i] = int64(modelW)
+			} else {
+				outShapeDims[i] = 1
+			}
 		}
 	}
 	if len(outShapeDims) == 0 {
-		if outChannels == 1 {
-			outShapeDims = []int64{1, 1, int64(width), int64(height)}
-		} else {
-			outShapeDims = []int64{1, int64(outChannels), int64(width), int64(height)}
-		}
+		outShapeDims = []int64{1, int64(modelH), int64(modelW)}
 	}
 
 	inputShape := ort.NewShape(inShapeDims...)
 	outputShape := ort.NewShape(outShapeDims...)
 
 	var totalIn int64 = 1
-	for _, dim := range inShapeDims { totalIn *= dim }
+	for _, dim := range inShapeDims {
+		totalIn *= dim
+	}
 
-	inTensor, _ := ort.NewTensor(inputShape, make([]float32, totalIn))
-	outTensor, _ := ort.NewEmptyTensor[float32](outputShape)
+	var inTensor ort.ArbitraryTensor
+	var inTensorF32 *ort.Tensor[float32]
+	var inTensorU8 *ort.Tensor[uint8]
+
+	if isUint8 {
+		inTensorU8, err = ort.NewTensor(inputShape, make([]uint8, totalIn))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create uint8 input tensor for %s: %w", modelPath, err)
+		}
+		inTensor = inTensorU8
+	} else {
+		inTensorF32, err = ort.NewTensor(inputShape, make([]float32, totalIn))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create float32 input tensor for %s: %w", modelPath, err)
+		}
+		inTensor = inTensorF32
+	}
+
+	outTensor, err := ort.NewEmptyTensor[float32](outputShape)
+	if err != nil {
+		inTensor.Destroy()
+		return nil, fmt.Errorf("failed to create output tensor for %s: %w", modelPath, err)
+	}
 
 	session, err := ort.NewAdvancedSession(absModelPath,
 		[]string{inputName}, []string{outputName},
 		[]ort.ArbitraryTensor{inTensor}, []ort.ArbitraryTensor{outTensor}, nil)
 	if err != nil {
-		return nil, err
+		inTensor.Destroy()
+		outTensor.Destroy()
+		return nil, fmt.Errorf("failed to create session for %s: %w", modelPath, err)
 	}
 
 	return &Engine{
-		session:      session,
-		inputTensor:  inTensor,
-		outputTensor: outTensor,
-		cache:        make(map[string]*image.Gray16),
+		session:       session,
+		inputTensor:   inTensorF32,
+		inputTensorU8: inTensorU8,
+		outputTensor:  outTensor,
+		isUint8:       isUint8,
+		isNHWC:        isNHWC,
+		inputWidth:    modelW,
+		inputHeight:   modelH,
+		cache:         make(map[string]*image.Gray16),
 	}, nil
 }
 
-// NEW: Native Go ONNX Shadow Removal
 func runShadowRemoval(img image.Image, engine *Engine) image.Image {
 	if engine == nil {
-		fmt.Println("Selected Shadow Engine not available, skipping...")
 		return img
 	}
-
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 
 	resized := imaging.Resize(img, ShadowInputSize, ShadowInputSize, imaging.Lanczos)
 	tensorData := engine.inputTensor.GetData()
 
-	// Normalize image to 0.0 -> 1.0 (Standard U-Net input)
 	for y := 0; y < ShadowInputSize; y++ {
 		for x := 0; x < ShadowInputSize; x++ {
 			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
@@ -224,16 +342,13 @@ func runShadowRemoval(img image.Image, engine *Engine) image.Image {
 		}
 	}
 
-	// Run AI Inference
 	if err := engine.session.Run(); err != nil {
-		fmt.Println("Shadow ONNX Run Error:", err)
 		return img
 	}
 
 	rawOut := engine.outputTensor.GetData()
 	outImg := image.NewRGBA(image.Rect(0, 0, ShadowInputSize, ShadowInputSize))
 
-	// Reconstruct RGB Image from AI Output
 	for y := 0; y < ShadowInputSize; y++ {
 		for x := 0; x < ShadowInputSize; x++ {
 			r := uint8(math.Max(0, math.Min(255, float64(rawOut[0*ShadowInputSize*ShadowInputSize+y*ShadowInputSize+x]*255.0))))
@@ -243,24 +358,19 @@ func runShadowRemoval(img image.Image, engine *Engine) image.Image {
 		}
 	}
 
-	// Resize back to original dimensions to feed into the Depth model seamlessly
 	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
 }
 
-// NEW: Native Go ONNX NAFNet HD Restoration (Deblur & Denoise)
 func runNafnetRestoration(img image.Image, engine *Engine) image.Image {
 	if engine == nil {
-		fmt.Println("NAFNet Engine not available, skipping...")
 		return img
 	}
-
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 
 	resized := imaging.Resize(img, NafnetInputSize, NafnetInputSize, imaging.Lanczos)
 	tensorData := engine.inputTensor.GetData()
 
-	// Normalize image to 0.0 -> 1.0 (Standard NAFNet input)
 	for y := 0; y < NafnetInputSize; y++ {
 		for x := 0; x < NafnetInputSize; x++ {
 			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
@@ -271,7 +381,6 @@ func runNafnetRestoration(img image.Image, engine *Engine) image.Image {
 	}
 
 	if err := engine.session.Run(); err != nil {
-		fmt.Println("NAFNet ONNX Run Error:", err)
 		return img
 	}
 
@@ -290,13 +399,10 @@ func runNafnetRestoration(img image.Image, engine *Engine) image.Image {
 	return imaging.Resize(outImg, img.Bounds().Dx(), img.Bounds().Dy(), imaging.Lanczos)
 }
 
-// NEW: Native Go ONNX U-2-Net Background Removal
 func runBackgroundRemoval(img image.Image, engine *Engine) image.Image {
 	if engine == nil {
-		fmt.Println("U-2-Net Engine not available, skipping...")
 		return img
 	}
-
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 
@@ -306,7 +412,6 @@ func runBackgroundRemoval(img image.Image, engine *Engine) image.Image {
 	mean := []float32{0.485, 0.456, 0.406}
 	std := []float32{0.229, 0.224, 0.225}
 
-	// Normalize ImageNet tensors
 	for y := 0; y < U2NetInputSize; y++ {
 		for x := 0; x < U2NetInputSize; x++ {
 			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
@@ -317,36 +422,40 @@ func runBackgroundRemoval(img image.Image, engine *Engine) image.Image {
 	}
 
 	if err := engine.session.Run(); err != nil {
-		fmt.Println("U-2-Net ONNX Run Error:", err)
 		return img
 	}
 
 	rawMask := engine.outputTensor.GetData()
 	minM, maxM := float32(math.MaxFloat32), float32(-math.MaxFloat32)
 	for _, v := range rawMask {
-		if v < minM { minM = v }
-		if v > maxM { maxM = v }
+		if v < minM {
+			minM = v
+		}
+		if v > maxM {
+			maxM = v
+		}
 	}
 	diffM := maxM - minM
-	if diffM == 0 { diffM = 1 }
+	if diffM == 0 {
+		diffM = 1
+	}
 
-	// Create Alpha Mask
 	maskImg := image.NewGray(image.Rect(0, 0, U2NetInputSize, U2NetInputSize))
 	for y := 0; y < U2NetInputSize; y++ {
 		for x := 0; x < U2NetInputSize; x++ {
 			norm := (rawMask[y*U2NetInputSize+x] - minM) / diffM
 			val := uint8(math.Min(255, math.Max(0, float64(norm)*255.0)))
-			if norm < 0.25 { val = 0 } // Hard cutoff for clean backgrounds
+			if norm < 0.25 {
+				val = 0
+			}
 			maskImg.SetGray(x, y, color.Gray{Y: val})
 		}
 	}
 
-	// Resize mask to original image dimensions
 	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
 	fullMask := imaging.Resize(maskImg, origW, origH, imaging.Lanczos)
 	outImg := image.NewRGBA(image.Rect(0, 0, origW, origH))
 
-	// Apply Mask: background becomes pure black
 	for y := 0; y < origH; y++ {
 		for x := 0; x < origW; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
@@ -363,28 +472,74 @@ func runBackgroundRemoval(img image.Image, engine *Engine) image.Image {
 	return outImg
 }
 
-// Helper: Run inference on a single image patch (Depth)
-func runInference(img image.Image) [][]float64 {
-	resized := imaging.Resize(img, ModelInputSize, ModelInputSize, imaging.Lanczos)
-	tensorData := globalDepthEngine.inputTensor.GetData()
-
-	mean := []float32{0.485, 0.456, 0.406}
-	std := []float32{0.229, 0.224, 0.225}
-
-	for y := 0; y < ModelInputSize; y++ {
-		for x := 0; x < ModelInputSize; x++ {
-			rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
-			tensorData[0*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
-			tensorData[1*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
-			tensorData[2*ModelInputSize*ModelInputSize+y*ModelInputSize+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
-		}
-	}
-
-	if err := globalDepthEngine.session.Run(); err != nil {
+func runInference(img image.Image, engine *Engine) [][]float64 {
+	if engine == nil {
+		fmt.Println("❌ Error: Depth engine is nil")
 		return nil
 	}
 
-	rawDepth := globalDepthEngine.outputTensor.GetData()
+	inW := engine.inputWidth
+	inH := engine.inputHeight
+	if inW <= 0 {
+		inW = ModelInputSize
+	}
+	if inH <= 0 {
+		inH = ModelInputSize
+	}
+
+	resized := imaging.Resize(img, inW, inH, imaging.Lanczos)
+
+	if engine.isUint8 {
+		tensorData := engine.inputTensorU8.GetData()
+		if engine.isNHWC {
+			// Packed NHWC format (R, G, B contiguous per pixel)
+			for y := 0; y < inH; y++ {
+				for x := 0; x < inW; x++ {
+					rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+					idx := (y*inW + x) * 3
+					tensorData[idx+0] = uint8(rCol >> 8)
+					tensorData[idx+1] = uint8(gCol >> 8)
+					tensorData[idx+2] = uint8(bCol >> 8)
+				}
+			}
+		} else {
+			// Planar NCHW format (R plane, G plane, B plane)
+			for y := 0; y < inH; y++ {
+				for x := 0; x < inW; x++ {
+					rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+					tensorData[0*inH*inW+y*inW+x] = uint8(rCol >> 8)
+					tensorData[1*inH*inW+y*inW+x] = uint8(gCol >> 8)
+					tensorData[2*inH*inW+y*inW+x] = uint8(bCol >> 8)
+				}
+			}
+		}
+	} else {
+		// Float32 Planar NCHW format with ImageNet normalization
+		tensorData := engine.inputTensor.GetData()
+		mean := []float32{0.485, 0.456, 0.406}
+		std := []float32{0.229, 0.224, 0.225}
+
+		for y := 0; y < inH; y++ {
+			for x := 0; x < inW; x++ {
+				rCol, gCol, bCol, _ := resized.At(x, y).RGBA()
+				tensorData[0*inH*inW+y*inW+x] = (float32(rCol>>8)/255.0 - mean[0]) / std[0]
+				tensorData[1*inH*inW+y*inW+x] = (float32(gCol>>8)/255.0 - mean[1]) / std[1]
+				tensorData[2*inH*inW+y*inW+x] = (float32(bCol>>8)/255.0 - mean[2]) / std[2]
+			}
+		}
+	}
+
+	if err := engine.session.Run(); err != nil {
+		fmt.Printf("❌ Depth ONNX Run Error: %v\n", err)
+		return nil
+	}
+
+	rawDepth := engine.outputTensor.GetData()
+	if len(rawDepth) == 0 {
+		fmt.Println("❌ Error: Output tensor returned 0 elements")
+		return nil
+	}
+
 	minVal, maxVal := float32(math.MaxFloat32), float32(-math.MaxFloat32)
 	for _, v := range rawDepth {
 		if v < minVal {
@@ -400,12 +555,14 @@ func runInference(img image.Image) [][]float64 {
 		diff = 1.0
 	}
 
-	out := make([][]float64, ModelInputSize)
-	for y := 0; y < ModelInputSize; y++ {
-		out[y] = make([]float64, ModelInputSize)
-		for x := 0; x < ModelInputSize; x++ {
-			val := float64(rawDepth[y*ModelInputSize+x]-minVal) / diff
-			out[y][x] = val
+	out := make([][]float64, inH)
+	for y := 0; y < inH; y++ {
+		out[y] = make([]float64, inW)
+		for x := 0; x < inW; x++ {
+			idx := y*inW + x
+			if idx < len(rawDepth) {
+				out[y][x] = float64(rawDepth[idx]-minVal) / diff
+			}
 		}
 	}
 	return out
@@ -440,7 +597,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		if rec := recover(); rec != nil {
-			fmt.Printf("Server Panic: %v\n", rec)
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Processing error: %v", rec)})
 		}
 	}()
@@ -452,7 +608,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	file, _, err := r.FormFile("image")
 	if err != nil {
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read image file: " + err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read image: " + err.Error()})
 		return
 	}
 	defer file.Close()
@@ -464,7 +620,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	isCoinMask := r.FormValue("coinMask") == "true"
 	isInvert := r.FormValue("invert") == "true"
 	removeShadows := r.FormValue("removeShadows") == "true"
-	removeBg := r.FormValue("removeBg") == "true" // NEW: Background Removal toggle
+	removeBg := r.FormValue("removeBg") == "true"
 	hdRestoration := r.FormValue("hdRestoration") == "true"
 	targetDim := r.FormValue("targetDim")
 
@@ -476,7 +632,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	var delightBase64 string
 	var bgBase64 string
-	bgOrder := r.FormValue("bgOrder") // "before" or "after" upscale
+	bgOrder := r.FormValue("bgOrder")
 	if bgOrder == "" {
 		bgOrder = "after"
 	}
@@ -485,17 +641,13 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		tileDensity = 2
 	}
 
-	// --- STEP 2: Go-Native AI Shadow Removal ---
 	if removeShadows {
 		shadowModelName := r.FormValue("shadowModel")
 		if shadowModelName == "" {
 			shadowModelName = "docshadow_sd7k.onnx"
 		}
 		selectedEngine := globalShadowEngines[shadowModelName]
-
-		fmt.Printf("[*] Running Shadow Removal with model: %s...\n", shadowModelName)
 		srcImg = runShadowRemoval(srcImg, selectedEngine)
-		fmt.Println("[+] Shadows removed!")
 
 		thumbDelight := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
 		var bufDelight []byte
@@ -504,12 +656,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		delightBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufDelight)
 	}
 
-	// --- STEP 2.5: U-2-Net Background Removal (If "Before Upscale" selected) ---
 	if removeBg && bgOrder == "before" && globalBgrEngine != nil {
-		fmt.Println("[*] Running U-2-Net Background Removal (Before Upscale)...")
 		srcImg = runBackgroundRemoval(srcImg, globalBgrEngine)
-		fmt.Println("[+] Background removed!")
-
 		thumbBg := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
 		var bufBg []byte
 		wBg := &byteWriter{buf: &bufBg}
@@ -517,14 +665,10 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		bgBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBg)
 	}
 
-	// --- STEP 3 (Stage A): NAFNet HD Restoration (Deblur & Denoise) ---
 	if hdRestoration && globalNafnetEngine != nil {
-		fmt.Println("[*] Running NAFNet HD Restoration (Deblur & Clean AI noise)...")
 		srcImg = runNafnetRestoration(srcImg, globalNafnetEngine)
-		fmt.Println("[+] HD Restoration complete!")
 	}
 
-	// --- STEP 3 (Stage B): Super-Resolution Upscaling (2K / 4K) ---
 	origW, origH := srcImg.Bounds().Dx(), srcImg.Bounds().Dy()
 	if targetDim == "2k" || targetDim == "4k" {
 		maxTarget := 2048
@@ -535,18 +679,13 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			scale := float64(maxTarget) / math.Max(float64(origW), float64(origH))
 			newW := int(float64(origW) * scale)
 			newH := int(float64(origH) * scale)
-			fmt.Printf("[*] Scaling artwork resolution to %s (%d × %d px)...\n", targetDim, newW, newH)
 			srcImg = imaging.Resize(srcImg, newW, newH, imaging.Lanczos)
 			origW, origH = newW, newH
 		}
 	}
 
-	// --- STEP 3.5: U-2-Net Background Removal (If "After Upscale" selected - Sharp 2K/4K Cutout) ---
 	if removeBg && bgOrder == "after" && globalBgrEngine != nil {
-		fmt.Println("[*] Running U-2-Net Background Removal AFTER Upscale (Sharp 2K/4K Edges)...")
 		srcImg = runBackgroundRemoval(srcImg, globalBgrEngine)
-		fmt.Println("[+] Post-upscale background removal complete!")
-
 		thumbBg := imaging.Resize(srcImg, 450, 0, imaging.Lanczos)
 		var bufBg []byte
 		wBg := &byteWriter{buf: &bufBg}
@@ -554,24 +693,35 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		bgBase64 = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufBg)
 	}
 
-	// Generate preview of the HD Upscaled / Restored image
 	thumbUpscale := imaging.Resize(srcImg, 650, 0, imaging.Lanczos)
 	var bufUpscale []byte
 	wUpscale := &byteWriter{buf: &bufUpscale}
 	jpeg.Encode(wUpscale, thumbUpscale, &jpeg.Options{Quality: 90})
 	upscaleBase64 := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(bufUpscale)
 
-	globalDepthEngine.mu.Lock()
-	defer globalDepthEngine.mu.Unlock()
+	depthModelName := r.FormValue("depthModel")
+	if depthModelName == "" {
+		depthModelName = defaultDepthModel
+	}
+	selectedDepthEngine := globalDepthEngines[depthModelName]
+	if selectedDepthEngine == nil {
+		selectedDepthEngine = globalDepthEngines[defaultDepthModel]
+	}
+	if selectedDepthEngine == nil {
+		json.NewEncoder(w).Encode(map[string]string{"error": "No DA3 Depth model is loaded in models/ folder"})
+		return
+	}
+
+	selectedDepthEngine.mu.Lock()
+	defer selectedDepthEngine.mu.Unlock()
 
 	// 1. GLOBAL BASE DEPTH INFERENCE
-	baseRaw := runInference(srcImg)
+	baseRaw := runInference(srcImg, selectedDepthEngine)
 	if baseRaw == nil {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Inference failed"})
 		return
 	}
 
-	// Rescale global depth to original dimensions
 	baseDepth := make([][]float64, origH)
 	for y := 0; y < origH; y++ {
 		baseDepth[y] = make([]float64, origW)
@@ -582,7 +732,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. HIERARCHICAL 2x2 OVERLAPPING TILING ENGINE
 	compiledTiles := make([][]float64, origH)
 	tileWeights := make([][]float64, origH)
 	for y := 0; y < origH; y++ {
@@ -599,7 +748,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		for i := 0; i < numX; i++ {
 			xCoords = append(xCoords, i*(origW-tileW)/max(1, numX-1))
 		}
-		// Add overlapping center coordinates
 		for i := 0; i < numX-1; i++ {
 			xCoords = append(xCoords, i*tileW+tileW/2)
 		}
@@ -617,7 +765,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 				tileRect := image.Rect(tx, ty, tx+tileW, ty+tileH)
 				tileSubImg := imaging.Crop(srcImg, tileRect)
 
-				tileRaw := runInference(tileSubImg)
+				tileRaw := runInference(tileSubImg, selectedDepthEngine)
 				if tileRaw == nil {
 					continue
 				}
@@ -679,7 +827,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. GAUSSIAN EDGE DIFFERENCE GUIDANCE
 	grayImg := imaging.Grayscale(srcImg)
 	blurred20 := imaging.Blur(grayImg, 5.0)
 	blurred40 := imaging.Blur(blurred20, 8.0)
@@ -744,7 +891,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := "current"
-	globalDepthEngine.cache[id] = result16Bit
+	selectedDepthEngine.cache[id] = result16Bit
 
 	thumbBase := imaging.Resize(baseDepthVisualizer, 450, 0, imaging.Lanczos)
 	var bufBase []byte
@@ -773,19 +920,19 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
-	globalDepthEngine.mu.Lock()
-	defer globalDepthEngine.mu.Unlock()
-
 	id := r.URL.Query().Get("id")
-	img, ok := globalDepthEngine.cache[id]
-	if !ok {
-		http.Error(w, "Not found", 404)
-		return
+	for _, eng := range globalDepthEngines {
+		eng.mu.Lock()
+		img, ok := eng.cache[id]
+		eng.mu.Unlock()
+		if ok {
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Content-Disposition", "attachment; filename=openrelief_16bit.png")
+			png.Encode(w, img)
+			return
+		}
 	}
-
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Content-Disposition", "attachment; filename=openrelief_16bit.png")
-	png.Encode(w, img)
+	http.Error(w, "Not found", 404)
 }
 
 type byteWriter struct{ buf *[]byte }
@@ -795,7 +942,6 @@ func (b *byteWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// Reports which AI models are loaded or missing
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -804,10 +950,15 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 		loadedShadows = append(loadedShadows, name)
 	}
 
+	loadedDA3 := []string{}
+	for name := range globalDepthEngines {
+		loadedDA3 = append(loadedDA3, name)
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"depthLoaded":   globalDepthEngine != nil,
-		"nafnetLoaded":  globalNafnetEngine != nil,
-		"u2netLoaded":   globalBgrEngine != nil, // NEW
-		"shadowModels":  loadedShadows,
+		"da3Models":    loadedDA3,
+		"nafnetLoaded": globalNafnetEngine != nil,
+		"u2netLoaded":  globalBgrEngine != nil,
+		"shadowModels": loadedShadows,
 	})
 }
